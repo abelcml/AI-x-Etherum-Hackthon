@@ -2,7 +2,7 @@
 
 从 [Handsel](https://github.com/Kairose-master/handsel/tree/482c3106efe16ec5d229ef945d7d95ef972d2b76) 提取三个原有合约，新增独立 Node 命令行适配 HSK 测试网（133）。保留上游许可证及合约 SPDX。
 
-**当前验证：36 项本地测试通过，三个合约编译通过；尚未部署或完成真实链上联调。**
+**当前验证：36 项本地测试通过，三个合约已部署到 HSK 测试网，并已跑通一次真实闭环（见 [docs/e2e-evidence.md](../docs/e2e-evidence.md)）。**
 
 ## 做什么
 
