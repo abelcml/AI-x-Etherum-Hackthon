@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f5f8f7" />
+    <meta name="description" content="HSK 测试网悬赏任务工作台" />
+    <title>任务工作台 · HSK Tasks</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar" aria-label="主导航">
+        <a class="brand" href="#main-content" aria-label="HSK Tasks 首页">
+          <span class="brand-mark" aria-hidden="true">H</span>
+          <span class="brand-copy">
+            <strong>HSK</strong>
+            <span>TASKS</span>
+          </span>
+        </a>
+
+        <nav class="sidebar-nav" aria-label="工作区">
+          <a class="nav-link is-active" href="#task-list" aria-current="page">
+            <span class="nav-icon" aria-hidden="true">▦</span>
+            <span>任务广场</span>
+          </a>
+          <a class="nav-link" href="#task-detail">
+            <span class="nav-icon" aria-hidden="true">↗</span>
+            <span>任务详情</span>
+          </a>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="sidebar-caption">轻量悬赏协议</span>
+          <a class="repo-link" href="https://github.com/abelcml/AI-x-Etherum-Hackthon" target="_blank" rel="noreferrer">
+            查看项目仓库 <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </aside>
+
+      <main class="app-main" id="main-content">
+        <header class="topbar">
+          <div class="topbar-context">
+            <span class="network-pill"><span class="network-dot" aria-hidden="true"></span>HSK 测试网</span>
+            <span class="topbar-divider" aria-hidden="true"></span>
+            <span class="wallet-status" id="wallet-status" role="status">钱包未连接</span>
+          </div>
+          <button class="button button-secondary wallet-button" id="wallet-button" type="button">
+            <span class="wallet-icon" aria-hidden="true">◈</span>
+            连接钱包
+          </button>
+        </header>
+
+        <div class="page-content">
+          <section class="demo-banner" aria-label="演示模式提示">
+            <span class="demo-icon" aria-hidden="true">✳</span>
+            <p><strong>演示模式</strong><span>当前展示本地示例任务，不发送交易；真实合约交互尚未接入。</span></p>
+            <span class="demo-tag">PREVIEW</span>
+          </section>
+
+          <section class="main-header" aria-labelledby="page-title">
+            <div class="page-heading">
+              <div>
+                <p class="eyebrow">BUILD · VERIFY · EARN</p>
+                <h1 id="page-title">任务工作台</h1>
+                <p class="page-intro">把需求变成清晰的悬赏任务，让交付与验收都有据可循。</p>
+              </div>
+              <div class="heading-actions">
+                <button class="button button-secondary" id="reset-button" type="button" title="恢复示例任务">
+                  <span aria-hidden="true">↺</span> 重置演示
+                </button>
+                <button class="button button-primary" id="new-task-button" type="button">
+                  <span aria-hidden="true">＋</span> 发布任务
+                </button>
+              </div>
+            </div>
+
+            <div class="stats-grid" aria-label="任务概览">
+              <article class="stat-card stat-card-open">
+                <div class="stat-topline"><span>开放中</span><span class="stat-icon" aria-hidden="true">◌</span></div>
+                <p class="stat-value" id="stat-open">—</p>
+                <p class="stat-note">等待贡献者接单</p>
+              </article>
+              <article class="stat-card stat-card-bounty">
+                <div class="stat-topline"><span>悬赏总额</span><span class="stat-icon" aria-hidden="true">◇</span></div>
+                <p class="stat-value"><span id="stat-bounty">—</span><span class="stat-unit">MockUSDC</span></p>
+                <p class="stat-note">尚未领取的示例奖励合计</p>
+              </article>
+              <article class="stat-card stat-card-completed">
+                <div class="stat-topline"><span>已完成</span><span class="stat-icon" aria-hidden="true">✓</span></div>
+                <p class="stat-value" id="stat-completed">—</p>
+                <p class="stat-note">已验收并完成结算</p>
+              </article>
+            </div>
+          </section>
+
+          <section class="workspace-grid" aria-label="悬赏任务">
+            <div class="task-column">
+              <div class="task-toolbar">
+                <div class="toolbar-title">
+                  <div>
+                    <h2>任务列表</h2>
+                    <p>浏览任务并查看交付要求</p>
+                  </div>
+                  <span class="task-count-badge" id="task-count" aria-live="polite">0 个任务</span>
+                </div>
+                <div class="filter-controls">
+                  <label class="search-field" for="search-input">
+                    <span aria-hidden="true">⌕</span>
+                    <input id="search-input" name="search" type="search" placeholder="搜索任务或 Issue" autocomplete="off" />
+                  </label>
+                  <label class="sr-only" for="status-filter">按状态筛选任务</label>
+                  <select id="status-filter" name="status" aria-label="按状态筛选">
+                    <option value="all">全部状态</option>
+                    <option value="open">开放中</option>
+                    <option value="accepted">进行中</option>
+                    <option value="submitted">待验收</option>
+                    <option value="completed">已完成</option>
+                  </select>
+                </div>
+              </div>
+
+              <div class="task-layout">
+                <div class="task-list" id="task-list" role="list" aria-label="任务列表">
+                  <div class="list-loading" role="status">正在载入任务…</div>
+                </div>
+                <aside class="detail-panel" aria-label="任务详情">
+                  <div id="task-detail" aria-live="polite">
+                    <span class="empty-illustration" aria-hidden="true">⌁</span>
+                    <h2>选择一个任务</h2>
+                    <p>任务要求、进度和可执行操作会显示在这里。</p>
+                  </div>
+                </aside>
+              </div>
+            </div>
+          </section>
+
+          <footer class="page-footer">
+            <span>HSK Tasks <span aria-hidden="true">·</span> 测试网演示</span>
+            <span>链上操作前请核对任务内容与奖励金额</span>
+          </footer>
+        </div>
+      </main>
+    </div>
+
+    <dialog class="modal" id="task-dialog" aria-labelledby="dialog-title">
+      <form id="task-form" method="dialog">
+        <div class="dialog-header">
+          <div>
+            <p class="eyebrow">NEW BOUNTY</p>
+            <h2 id="dialog-title">发布悬赏任务</h2>
+            <p>把需求、Issue 和奖励写清楚，方便贡献者快速开始。</p>
+          </div>
+          <button class="icon-button" id="cancel-dialog" type="button" aria-label="关闭发布窗口">×</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="form-field form-field-wide" for="task-title">
+            <span>任务标题 <span class="required-mark" aria-hidden="true">*</span></span>
+            <input id="task-title" name="title" type="text" maxlength="100" placeholder="例如：为任务列表补充筛选功能" required />
+          </label>
+          <label class="form-field form-field-wide" for="task-issue">
+            <span>GitHub Issue 链接 <span class="required-mark" aria-hidden="true">*</span></span>
+            <input id="task-issue" name="issue" type="url" inputmode="url" placeholder="https://github.com/组织/仓库/issues/123" required />
+          </label>
+          <label class="form-field" for="task-bounty">
+            <span>悬赏金额 <span class="required-mark" aria-hidden="true">*</span></span>
+            <span class="input-with-suffix"><input id="task-bounty" name="bounty" type="number" min="1" step="0.01" placeholder="10" required /><span>USDC</span></span>
+          </label>
+          <label class="form-field" for="task-window">
+            <span>交付时限</span>
+            <select id="task-window" name="window">
+              <option value="3600">1 小时</option>
+              <option value="21600">6 小时</option>
+              <option value="86400" selected>24 小时</option>
+            </select>
+          </label>
+          <label class="form-field form-field-wide" for="task-description">
+            <span>补充说明 <span class="field-optional">选填</span></span>
+            <textarea id="task-description" name="description" rows="3" maxlength="1000" placeholder="验收标准、注意事项或交付说明"></textarea>
+          </label>
+        </div>
+
+        <div class="dialog-note"><span aria-hidden="true">ⓘ</span> 发布前请确认奖励金额与交付要求。演示模式下不会提交链上交易。</div>
+        <div class="dialog-actions">
+          <button class="button button-secondary" type="button" data-dialog-close>取消</button>
+          <button class="button button-primary" type="submit">创建任务</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div class="toast" id="toast" role="status" aria-live="polite" aria-atomic="true"></div>
+  </body>
+</html>
