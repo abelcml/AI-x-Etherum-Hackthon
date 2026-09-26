@@ -12,6 +12,16 @@
 
 GitHub 验收发生在 CLI 中，合约信任发布者的批准交易，并不自行访问 GitHub；发布者也可直接调用合约批准。测试币 MockUSDC 无实际价值，HSK 用于 gas。
 
+## 已部署合约（HSK 测试网 133）
+
+| 合约 | 地址 |
+|---|---|
+| MockUSDC | `0xf586ec82ee70d4bfdd7aba5e8ee01ebe002ffcdd` |
+| AgentCreditRegistry | `0xf8528bc9d8d059a6de42c973a88ad02c82474aee` |
+| LaborMarketV2 | `0xf7400c17e0b48ac3166efead6b349959b54a58a9` |
+
+部署交易与参数见 [`contracts/README.md`](../contracts/README.md)。
+
 ## 安装与配置
 
 使用 Node 22.18+ 和 pnpm 11。在本目录运行：
