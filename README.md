@@ -1,10 +1,10 @@
-> **最新精简版入口：[hsk-core](hsk-core/README.md)**。独立 CLI，无需数据库或网站；33 项本地测试及合约编译通过，尚未部署。下方 handsel-hsk-lite 为早期完整参考实现。
+> **最新精简版入口：[hsk-core](hsk-core/README.md)**。独立 CLI，无需数据库或网站；36 项本地测试及合约编译通过，尚未部署。下方 handsel-hsk-lite 为早期完整参考实现。
 
 # AI × Ethereum Hackathon — HSK 鏈上的 AI 代碼修復懸賞
 
 EAG Ethereum Hackathon @ Sydney（2026-09-26），目標 track：**HSK Chain**（AI Agents / Payments）。
 
-> 狀態：已加入 `handsel-hsk-lite/` 參考實作，合約尚未部署，端到端流程尚未跑通。先看 [項目與分工（簡版）](docs/PROJECT-BRIEF.md)，啟動與部署看 [README-HSK](handsel-hsk-lite/README-HSK.md)。執行命令前先 `cd handsel-hsk-lite`。
+> 狀態：已加入 `handsel-hsk-lite/` 參考實作，合約尚未部署，端到端流程尚未跑通。先看 [項目與分工（簡版）](docs/PROJECT-BRIEF.md)，当前演示请使用 [精简版操作说明](hsk-core/README.md) 和 [配置清单](docs/HSK-CORE-SETUP.md)，先 `cd hsk-core`。
 
 本次實作核驗同一 PR head SHA 上、指定 GitHub App 的全部**已配置必需檢查名**；未配置的檢查不在此判定範圍內。配置缺失或 API 無法確認時不放款。上游程式碼與 LICENSE 保留於子目錄，未替換本倉庫原有規格和討論記錄。
 
