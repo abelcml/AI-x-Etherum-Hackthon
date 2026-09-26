@@ -12,6 +12,10 @@ pnpm compile
 pnpm web:commons
 ```
 
+仓库中已登记的公共合约地址与 GitHub 检查配置在 `.env.commons.example`。首次运行且没有 `.env.local` 时，可复制该文件为 `.env.local`；已有配置请手动合并，勿覆盖钱包配置。默认发送关闭。公开仓库只读 GitHub 查询可不填 token，但受 API 限额影响。
+
+真实 GitHub 验收的现成例子：本仓库 PR #7，提交 SHA `959d86d041b6859a07b17030447736d3bcb0b2ae`，检查 `hsk-checks`，App ID `15368`。这是验证接口的样例，不是赏金任务结算证据。不能据此宣称这个 PR 已收款。
+
 打开 `http://127.0.0.1:4174`。没有 `.env.local` 也可执行真实 CSV 去重与文件验收。代码与链上功能按页面显示的缺项配置，不能用模拟状态替代。
 
 ## 已接入
