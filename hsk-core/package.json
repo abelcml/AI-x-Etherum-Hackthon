@@ -1,0 +1,17 @@
+{
+  "name": "hsk-bounty-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.18" },
+  "scripts": {
+    "compile": "node scripts/compile.mjs",
+    "test": "node --test tests/*.test.mjs",
+    "check": "node --env-file-if-exists=.env.local scripts/check.mjs",
+    "deploy": "node --env-file-if-exists=.env.local scripts/deploy.mjs",
+    "mint": "node --env-file-if-exists=.env.local scripts/mint.mjs",
+    "job": "node --env-file-if-exists=.env.local scripts/job.mjs"
+  },
+  "dependencies": { "viem": "2.55.1" },
+  "devDependencies": { "solc": "0.8.24" }
+}

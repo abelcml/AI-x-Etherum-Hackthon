@@ -1,3 +1,5 @@
+> **最新精简版入口：[hsk-core](hsk-core/README.md)**。独立 CLI，无需数据库或网站；33 项本地测试及合约编译通过，尚未部署。下方 handsel-hsk-lite 为早期完整参考实现。
+
 # AI × Ethereum Hackathon — HSK 鏈上的 AI 代碼修復懸賞
 
 EAG Ethereum Hackathon @ Sydney（2026-09-26），目標 track：**HSK Chain**（AI Agents / Payments）。
