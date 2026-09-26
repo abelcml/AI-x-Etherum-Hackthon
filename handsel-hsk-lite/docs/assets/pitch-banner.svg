@@ -1,0 +1,13 @@
+<svg viewBox="0 0 900 190" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Ledgermind">
+  <rect x="1" y="1" width="898" height="188" rx="8" fill="#F7F5EE" stroke="#DFD8C3"/>
+  <g stroke="#EDE9DD" stroke-width="1">
+    <line x1="0" y1="46" x2="900" y2="46"/>
+    <line x1="0" y1="92" x2="900" y2="92"/>
+    <line x1="0" y1="138" x2="900" y2="138"/>
+  </g>
+  <rect x="40" y="60" width="52" height="52" rx="6" fill="#2F6F4F"/>
+  <text x="66" y="95" font-family="SF Mono, Menlo, Consolas, monospace" font-size="26" font-weight="700" fill="#F7F5EE" text-anchor="middle">L</text>
+  <text x="112" y="88" font-family="Georgia, 'Iowan Old Style', serif" font-size="42" fill="#14140F">Ledgermind</text>
+  <text x="112" y="118" font-family="-apple-system, Segoe UI, sans-serif" font-size="16" fill="#6B7267">An on-chain credit history for AI agents</text>
+  <text x="860" y="30" font-family="SF Mono, Menlo, Consolas, monospace" font-size="12" fill="#6B7267" text-anchor="end" letter-spacing="1">GASOK · MVP BUILD</text>
+</svg>

@@ -1,0 +1,41 @@
+<svg viewBox="0 0 900 230" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Score, rating, limit, draw, repay loop">
+  <defs>
+    <marker id="arrow1" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#6B7267"/>
+    </marker>
+    <marker id="arrow2" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0,0 L8,4 L0,8 Z" fill="#2F6F4F"/>
+    </marker>
+  </defs>
+  <g font-family="-apple-system, Segoe UI, sans-serif">
+    <!-- nodes -->
+    <g>
+      <rect x="15" y="40" width="140" height="56" rx="6" fill="#F7F5EE" stroke="#DFD8C3"/>
+      <text x="85" y="73" font-size="14" font-weight="600" fill="#14140F" text-anchor="middle">Score</text>
+    </g>
+    <g>
+      <rect x="195" y="40" width="140" height="56" rx="6" fill="#F7F5EE" stroke="#DFD8C3"/>
+      <text x="265" y="73" font-size="14" font-weight="600" fill="#14140F" text-anchor="middle">Rating</text>
+    </g>
+    <g>
+      <rect x="375" y="40" width="140" height="56" rx="6" fill="#F7F5EE" stroke="#DFD8C3"/>
+      <text x="445" y="73" font-size="14" font-weight="600" fill="#14140F" text-anchor="middle">Credit limit</text>
+    </g>
+    <g>
+      <rect x="555" y="40" width="140" height="56" rx="6" fill="#F7F5EE" stroke="#DFD8C3"/>
+      <text x="625" y="73" font-size="14" font-weight="600" fill="#14140F" text-anchor="middle">Draw</text>
+    </g>
+    <g>
+      <rect x="735" y="40" width="150" height="56" rx="6" fill="#EAF2EC" stroke="#2F6F4F"/>
+      <text x="810" y="73" font-size="14" font-weight="600" fill="#2F6F4F" text-anchor="middle">Repay</text>
+    </g>
+    <!-- forward arrows -->
+    <line x1="155" y1="68" x2="191" y2="68" stroke="#6B7267" stroke-width="1.5" marker-end="url(#arrow1)"/>
+    <line x1="335" y1="68" x2="371" y2="68" stroke="#6B7267" stroke-width="1.5" marker-end="url(#arrow1)"/>
+    <line x1="515" y1="68" x2="551" y2="68" stroke="#6B7267" stroke-width="1.5" marker-end="url(#arrow1)"/>
+    <line x1="695" y1="68" x2="731" y2="68" stroke="#6B7267" stroke-width="1.5" marker-end="url(#arrow1)"/>
+    <!-- return arrow -->
+    <path d="M 810 96 C 810 190, 85 190, 85 96" fill="none" stroke="#2F6F4F" stroke-width="1.5" marker-end="url(#arrow2)"/>
+    <text x="450" y="205" font-size="13" fill="#2F6F4F" text-anchor="middle">on-time repayment raises the score — the loop compounds</text>
+  </g>
+</svg>

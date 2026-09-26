@@ -1,0 +1,572 @@
+# Solana devnet — build always, deploy only when asked.
+#
+# `cargo check` (the in-repo gate) type-checks the program against the host
+# target. It does NOT prove the program links as an SBF object, and it does not
+# produce an IDL — so it cannot catch a stack-frame overflow, a missing
+# `idl-build` feature, or an account struct too large for the loader. That is
+# what this workflow is for: the build job is the real compile.
+#
+# Deploy is `workflow_dispatch` only. Devnet SOL is free but not infinite, a
+# program deploy is a real transaction, and an accidental redeploy on every
+# push to main would burn the deployer's balance and churn the program's data
+# account. Someone has to mean it.
+#
+# Nothing here touches mainnet, and there is no mainnet job to add later by
+# mistake: `docs/solana-port.md` records devnet as a decision, and this file
+# hardcodes the cluster rather than reading it from an input.
+name: Solana devnet
+
+on:
+  push:
+    branches: [main]
+    paths: ['solana/**', '.github/workflows/solana-devnet.yml']
+  pull_request:
+    paths: ['solana/**', '.github/workflows/solana-devnet.yml']
+  workflow_dispatch:
+    inputs:
+      # This gates the whole devnet JOB, not just the upload — verification,
+      # happy path and the chain read all live inside it. Leaving it unchecked
+      # runs the build alone and reports success without touching the cluster,
+      # which happened, and looked exactly like a deploy that worked.
+      #
+      # Whether the binary is actually uploaded is a separate decision made by
+      # preflight: if the chain already has these bytes, the upload is skipped
+      # and the run is a two-minute check.
+      deploy:
+        description: 'Run against devnet — verify, and upload only if the chain lacks this build (needs SOLANA_DEPLOYER_KEYPAIR + SOLANA_PROGRAM_KEYPAIR)'
+        type: boolean
+        default: false
+      # Default TRUE. A deploy that is never exercised is a green run that
+      # proves the binary uploaded and nothing about whether it works — which
+      # is how a program that credits a ledger nobody can withdraw from sat on
+      # devnet under a checkmark. Opting OUT is the deliberate act now.
+      run_happy_path:
+        description: 'Run the end-to-end script against the deployed program'
+        type: boolean
+        default: true
+
+env:
+  ANCHOR_VERSION: 0.31.1
+  SOLANA_CLUSTER: https://api.devnet.solana.com
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    # 90, not 45, and the reason is a loop rather than a slow build. A cold
+    # run compiles avm from git and then compiles anchor-cli through it --
+    # twenty-five to forty minutes before `cargo check` has started. At 45 the
+    # job was killed partway, GitHub reported it as CANCELLED (a timeout is a
+    # cancellation, which is why nobody had cancelled it), and **a killed job
+    # does not save its cache**. So the next run was cold too, and timed out
+    # too. Every run cold, every run cancelled, forever. A ceiling only helps
+    # if the ordinary case fits under it; this one has to fit the cold case
+    # ONCE, and after that the cache makes it minutes.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      # Two caches, deliberately. They used to be one entry keyed on the
+      # Cargo.toml hash, which put a ~700 MB toolchain that changes when
+      # ANCHOR_VERSION changes in the same bucket as multi-GB build output that
+      # changes constantly. A repo gets 10 GB; the oldest entries are evicted
+      # to stay under it, and evicting build output took the Anchor
+      # installation with it -- reintroducing the forty-minute cold compile at
+      # random.
+      # restore + an explicit save, rather than `actions/cache`, and the split
+      # is the point. `actions/cache` saves in a post-job step, and a job that
+      # is CANCELLED -- which is what a timeout is -- never reaches it. That is
+      # the loop: cold run, killed at the ceiling, nothing saved, next run cold
+      # again. Saving the instant the toolchain exists means the forty-minute
+      # compile is paid at most once, whatever happens to the rest of the job.
+      - name: Restore the Anchor toolchain
+        id: anchor-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.avm
+          key: anchor-toolchain-${{ runner.os }}-${{ env.ANCHOR_VERSION }}
+
+      - name: Cache cargo registry + build output
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            solana/target
+          key: solana-build-${{ runner.os }}-${{ hashFiles('solana/Cargo.lock') }}
+          restore-keys: solana-build-${{ runner.os }}-
+
+      - name: Install Solana CLI (Anza)
+        run: |
+          if ! command -v solana >/dev/null 2>&1; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      - name: Install Anchor ${{ env.ANCHOR_VERSION }}
+        run: |
+          # Check for the versioned binary avm actually installs, not for avm
+          # itself. `avm install` on an already-installed version is not free,
+          # and this is the step the whole cache split exists to skip.
+          if [ -x "$HOME/.avm/bin/anchor-$ANCHOR_VERSION" ]; then
+            echo "anchor $ANCHOR_VERSION restored from cache"
+          else
+            echo "cold: compiling avm and anchor-cli — this is the slow one"
+            command -v avm >/dev/null 2>&1 ||
+              cargo install --git https://github.com/coral-xyz/anchor avm --locked --force
+            avm install "$ANCHOR_VERSION"
+          fi
+          avm use "$ANCHOR_VERSION"
+          echo "$HOME/.avm/bin" >> "$GITHUB_PATH"
+
+      # Immediately, while it exists — not in a post step that a timeout skips.
+      - name: Save the Anchor toolchain
+        if: steps.anchor-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.avm
+          key: anchor-toolchain-${{ runner.os }}-${{ env.ANCHOR_VERSION }}
+
+      - run: |
+          solana --version
+          anchor --version
+          # The number that actually matters, and the one that was a guess
+          # until the first failure: the SBF toolchain bundles its OWN rustc,
+          # older than the host's, and that is what has to parse every
+          # dependency's manifest.
+          cargo-build-sbf --version || true
+
+      # The host-target gate, run here too so a CI-only regression can't hide
+      # behind the SBF build's different feature resolution.
+      - name: cargo check (host target)
+        working-directory: solana
+        run: cargo check --locked
+
+      # Fails BEFORE the SBF build with the full list of offenders. The first
+      # time this bit, `anchor build` reported exactly one crate name per CI
+      # round-trip; there were sixteen. See scripts/check-msrv.mjs.
+      - name: Locked deps fit the SBF toolchain
+        working-directory: solana
+        run: node scripts/check-msrv.mjs
+
+      - name: anchor build (SBF + IDL)
+        working-directory: solana
+        run: anchor build
+
+      # `anchor build` MINTS a program keypair at target/deploy/ when none is
+      # there, and this job has no authoritative one — the real key lives in a
+      # secret only the deploy job receives. So the keypair sitting here is a
+      # throwaway the build invented, and comparing it against `declare_id!`
+      # answers a question nobody asked. (It was compared, and it failed, and
+      # the check was right to fail — it was just in the wrong job.)
+      #
+      # It is deleted rather than ignored, because `solana/target` is CACHED:
+      # a throwaway left behind gets restored into later runs, including the
+      # deploy job, where a stale keypair is exactly the thing that deploys a
+      # program to an address every client then fails to find.
+      - name: Drop the throwaway keypair anchor build minted
+        working-directory: solana
+        run: |
+          echo "declared: $(grep -oP 'declare_id!\("\K[^"]+' programs/handsel-market/src/lib.rs)"
+          echo "The build/deploy address match is verified in the deploy job,"
+          echo "which is where the real keypair exists."
+          rm -f target/deploy/handsel_market-keypair.json
+
+      - name: Type-check the devnet scripts against the generated IDL
+        working-directory: solana
+        run: |
+          npm ci --no-audit --no-fund
+          npx tsc --noEmit -p tsconfig.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: handsel-market-sbf
+          path: |
+            solana/target/deploy/handsel_market.so
+            solana/target/idl/handsel_market.json
+            solana/target/types/handsel_market.ts
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    if: github.event_name == 'workflow_dispatch' && inputs.deploy
+    runs-on: ubuntu-latest
+    # This was 20, on the theory that "a program upload over an endpoint that
+    # can take it is a couple of minutes" and a throttled run should be
+    # reported while someone is still watching. The measurement says otherwise:
+    # the upload of this 428 KB binary takes **19 minutes 50 seconds**. The
+    # ceiling was set to the ordinary case, so the run was killed ten seconds
+    # after the upgrade landed on chain -- the deploy had actually SUCCEEDED,
+    # and every step after it was skipped, including the two that would have
+    # said so.
+    #
+    # A ceiling has to sit above the ordinary case by enough that crossing it
+    # means something is wrong. 45 does; 20 was the ordinary case wearing a
+    # limit's clothing. The buffer reclaim below is `if: always()`, so a
+    # timeout still returns its SOL.
+    timeout-minutes: 45
+    environment: solana-devnet
+    steps:
+      - uses: actions/checkout@v4
+
+      # No cargo, no avm, no anchor here. This job used to rebuild the program
+      # from source before deploying, which cost fifteen minutes and bought
+      # nothing: the `.so` does not contain the keypair, only `declare_id!`,
+      # which comes from source either way. The keypair is needed to SIGN the
+      # deploy, not to produce the binary.
+      #
+      # Downloading the build job's artifact is faster and also stricter — the
+      # bytes that reach devnet are now literally the artifact attached to this
+      # run, which anyone can download and hash against the on-chain program.
+      # Deliberately uncached. A cache key with no version in it pins whatever
+      # CLI was current the day it was written, and this sprint already lost a
+      # round trip to a CLI that asks the loader for something the loader has
+      # since stopped accepting. Thirty seconds of download is the cheaper side
+      # of that trade.
+      - name: Install Solana CLI (Anza)
+        run: |
+          if ! command -v solana >/dev/null 2>&1; then
+            sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          fi
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      # The artifact's root is `solana/target`, so this restores
+      # target/deploy/handsel_market.so exactly where the deploy expects it.
+      - uses: actions/download-artifact@v4
+        with:
+          name: handsel-market-sbf
+          path: solana/target
+
+      # Keypairs arrive as secrets and land outside the workspace, so a later
+      # step that archives or uploads the checkout cannot sweep them up.
+      - name: Materialise keypairs
+        env:
+          DEPLOYER: ${{ secrets.SOLANA_DEPLOYER_KEYPAIR }}
+          PROGRAM: ${{ secrets.SOLANA_PROGRAM_KEYPAIR }}
+        run: |
+          if [ -z "$DEPLOYER" ] || [ -z "$PROGRAM" ]; then
+            echo "::error::SOLANA_DEPLOYER_KEYPAIR and SOLANA_PROGRAM_KEYPAIR must both be set."
+            exit 1
+          fi
+          mkdir -p "$HOME/.solana-keys" && chmod 700 "$HOME/.solana-keys"
+          printf '%s' "$DEPLOYER" > "$HOME/.solana-keys/deployer.json"
+          printf '%s' "$PROGRAM" > "$HOME/.solana-keys/program.json"
+          chmod 600 "$HOME/.solana-keys"/*.json
+          # A dedicated endpoint if one is configured. The public devnet RPC
+          # drops the hundreds of small writes a program upload is made of --
+          # that is what "Max retries exceeded" means, and no amount of
+          # retrying fixes a rate limit.
+          RPC="${{ secrets.SOLANA_RPC_URL }}"
+          [ -n "$RPC" ] || RPC="$SOLANA_CLUSTER"
+          echo "SOLANA_RPC=$RPC" >> "$GITHUB_ENV"
+          case "$RPC" in
+            "$SOLANA_CLUSTER")
+              echo "rpc: public devnet — uploads are rate-limited here and a"
+              echo "     program deploy may not finish. Set SOLANA_RPC_URL."
+              ;;
+            *) echo "rpc: dedicated endpoint from SOLANA_RPC_URL" ;;
+          esac
+          # Cheap sanity check on the endpoint before spending twenty minutes
+          # discovering it points somewhere else. A mainnet URL answers this
+          # perfectly well and then reports the deployer as unfunded, which
+          # looks like a faucet problem rather than a wrong-cluster one.
+          GENESIS=$(curl -sS -X POST "$RPC" -H 'content-type: application/json' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"getGenesisHash"}' | sed -n 's/.*"result":"\([^"]*\)".*/\1/p')
+          DEVNET_GENESIS=EtWTRABZaYq6iMfeYKouRu166VU2xqa1wcaWoxPkrZBG
+          echo "genesis: ${GENESIS:-<no answer>}"
+          if [ "$GENESIS" != "$DEVNET_GENESIS" ]; then
+            echo "::error::That endpoint is not devnet (genesis $GENESIS)."
+            echo "Devnet's genesis hash is $DEVNET_GENESIS."
+            echo "A mainnet Helius URL is the usual cause — the host is"
+            echo "devnet.helius-rpc.com, not mainnet.helius-rpc.com."
+            exit 1
+          fi
+          solana config set --url "$RPC" --keypair "$HOME/.solana-keys/deployer.json"
+          echo "deployer: $(solana address)"
+
+      # A failed deploy STRANDS its buffer account, and a program buffer holds
+      # rent for the whole binary -- 1.5-2 SOL for this one. Retrying without
+      # reclaiming it means every attempt eats another wallet's worth, which is
+      # how a flaky RPC turns into "the faucet won't give me any more".
+      # Closing first is idempotent: with nothing stranded it reports nothing.
+      - name: Reclaim SOL from buffers a previous attempt stranded
+        run: |
+          echo "before: $(solana balance)"
+          solana program close --buffers --url "$SOLANA_RPC" || true
+          echo "after:  $(solana balance)"
+
+      - name: Fund the deployer if it is short
+        run: |
+          BAL=$(solana balance --lamports | awk '{print $1}')
+          echo "balance: $BAL lamports"
+          # A program deploy is rent-exempt storage for the whole binary; a few
+          # SOL covers it with room for the happy-path script's rent.
+          if [ "$BAL" -lt 3000000000 ]; then
+            # Devnet's faucet rate-limits hard. Failing here is fine — it means
+            # a human tops the wallet up, which is better than a deploy that
+            # dies halfway and leaves a half-written buffer account.
+            solana airdrop 2 || echo "::warning::airdrop failed; deploying with what is on hand"
+          fi
+
+      # ONE step that reports every precondition at once, before a lamport is
+      # spent. It exists because eight deploy attempts taught eight separate
+      # single facts -- an MSRV, a check in the wrong job, RPC throttling, a
+      # retry budget, funding, an unchecked dispatch input, a loader that only
+      # extends in 10240s -- at fifteen to forty-five minutes per fact. The
+      # problems were all real; the loop was the defect. This is the same
+      # answer as scripts/check-msrv.mjs: when a round trip is expensive, make
+      # one run say everything it knows.
+      #
+      # It runs AFTER the reclaim and the airdrop so the balance it reports is
+      # the one the deploy will actually have.
+      - name: Preflight — every precondition, in one pass
+        working-directory: solana
+        run: |
+          cp "$HOME/.solana-keys/program.json" target/deploy/handsel_market-keypair.json
+          chmod 600 target/deploy/handsel_market-keypair.json
+          fail=0
+          say() { printf '  %-22s %s\n' "$1" "$2"; }
+
+          PID=$(solana address -k target/deploy/handsel_market-keypair.json)
+          DECLARED=$(grep -oP 'declare_id!\("\K[^"]+' programs/handsel-market/src/lib.rs)
+          say "program keypair" "$PID"
+          if [ "$PID" = "$DECLARED" ]; then
+            say "declare_id!" "matches"
+          else
+            say "declare_id!" "$DECLARED   <-- MISMATCH"
+            fail=$((fail + 1))
+          fi
+
+          LOCAL=$(wc -c < target/deploy/handsel_market.so)
+          say "artifact" "$LOCAL bytes (from the build job)"
+
+          # `Data Length` is already net of the 45-byte ProgramData header, so
+          # it compares directly with the .so on disk.
+          HAVE=$(solana program show --url "$SOLANA_RPC" "$PID" 2>/dev/null |
+                 sed -n 's/^Data Length: *\([0-9]*\).*/\1/p')
+          EXTRA=0
+          if [ -z "$HAVE" ]; then
+            say "on chain" "not deployed — the first deploy sizes the account"
+          elif [ "$LOCAL" -gt "$HAVE" ]; then
+            EXTRA=$((LOCAL - HAVE + 10240))
+            say "on chain" "$HAVE bytes"
+            say "capacity" "short by $((LOCAL - HAVE)) — will extend by $EXTRA"
+          else
+            say "on chain" "$HAVE bytes"
+            say "capacity" "$((HAVE - LOCAL)) bytes to spare"
+          fi
+          echo "EXTEND_BY=$EXTRA" >> "$GITHUB_ENV"
+
+          # Is the chain already serving exactly these bytes? Then the upload
+          # is twenty minutes of re-sending what is already there. Skipping it
+          # makes a re-run a one-minute check instead of a repeat of the thing
+          # that just timed out — which matters most in the case that produced
+          # this step: a deploy that SUCCEEDED and was killed before it could
+          # report, leaving the verification and the happy path unrun.
+          NEED_DEPLOY=1
+          if [ -n "$HAVE" ] && [ "$EXTRA" -eq 0 ] &&
+             solana program dump --url "$SOLANA_RPC" "$PID" /tmp/onchain.so >/dev/null 2>&1; then
+            if [ "$(head -c "$LOCAL" /tmp/onchain.so | sha256sum | cut -d' ' -f1)" \
+               = "$(sha256sum target/deploy/handsel_market.so | cut -d' ' -f1)" ]; then
+              NEED_DEPLOY=0
+            fi
+          fi
+          rm -f /tmp/onchain.so
+          if [ "$NEED_DEPLOY" -eq 0 ]; then
+            say "deploy" "chain already has these bytes — skipping the upload"
+          else
+            say "deploy" "will upload $LOCAL bytes (about 20 minutes)"
+          fi
+          echo "NEED_DEPLOY=$NEED_DEPLOY" >> "$GITHUB_ENV"
+          echo "PROGRAM_ID=$PID" >> "$GITHUB_ENV"
+
+          # Rent-exempt minimum is exactly (128 + data_len) * 6960 lamports —
+          # 128 bytes of account overhead, 3480 lamports per byte-year, two
+          # years. Computing it beats parsing `solana rent`, and it is the same
+          # arithmetic the loader used to price the 2.98414872 SOL that a
+          # previous run discovered by running out of money.
+          BUF=$(( (128 + 45 + LOCAL) * 6960 ))
+          EXT=$(( EXTRA * 6960 ))
+          NEED=$(( BUF + EXT + 20000000 ))
+          BAL=$(solana balance --lamports | awk '{print $1}')
+          sol() { awk -v l="$1" 'BEGIN { printf "%.4f SOL", l / 1e9 }'; }
+          say "buffer rent" "$(sol "$BUF")   (transient, refunded)"
+          # An `if`, not `[ ... ] && say ...`: the step runs under `bash -e`,
+          # where a trailing false test IS the line's exit status and kills the
+          # job. It would have fired on every run that did NOT need an extend —
+          # that is, on all the ordinary ones.
+          if [ "$EXT" -gt 0 ]; then
+            say "extend rent" "$(sol "$EXT")   (permanent)"
+          fi
+          say "needed + fees" "$(sol "$NEED")"
+          say "deployer balance" "$(sol "$BAL")"
+          if [ "$BAL" -lt "$NEED" ]; then
+            say "" "SHORT BY $(sol "$((NEED - BAL))")"
+            fail=$((fail + 1))
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::Preflight found $fail blocking problem(s). Nothing was spent."
+            exit 1
+          fi
+          echo "  ready."
+
+      # An upgrade cannot grow the program account by itself, and the two sides
+      # disagree about how: `solana program deploy` asks the loader to extend by
+      # exactly the shortfall, and the loader refuses anything under 10240
+      # bytes. The build that added a `bump` argument came out 88 bytes larger
+      # than the deployed one, so the deploy died on
+      #
+      #   ExtendProgram requires a minimum of 10240 additional bytes or to
+      #   extend to maximum size, but only 88 were requested
+      #
+      # which no amount of retrying moves: 88 is 88 every time. Extending
+      # deliberately, in a legal step size and with slack, is the fix — and it
+      # has to happen BEFORE the deploy, because the deploy is what fails.
+      #
+      # Skipped on a first deploy: with no program on chain there is nothing to
+      # extend, and `solana program deploy` sizes the account itself.
+      # The size to add was decided in preflight (shortfall + the 10240
+      # minimum) and passed through EXTEND_BY, so this step only spends.
+      - name: Grow the program account
+        if: env.EXTEND_BY != '0'
+        working-directory: solana
+        run: |
+          PID=$(solana address -k target/deploy/handsel_market-keypair.json)
+          echo "extending $PID by $EXTEND_BY bytes"
+          solana program extend --url "$SOLANA_RPC" \
+            --keypair "$HOME/.solana-keys/deployer.json" "$PID" "$EXTEND_BY"
+          solana program show --url "$SOLANA_RPC" "$PID" | sed -n 's/^Data Length/now/p'
+
+      - name: Deploy to devnet
+        if: env.NEED_DEPLOY != '0'
+        working-directory: solana
+        run: |
+          # --use-rpc sends the write transactions through the RPC instead of
+          # forwarding them to validator TPUs. On a shared endpoint the TPU
+          # path is where they vanish, and it is the documented workaround.
+          # --max-sign-attempts defaults to 5, which is not many when a few
+          # hundred writes each get one chance. 30 is the compromise: it was
+          # briefly 100, and on a throttled endpoint that did not fix anything,
+          # it just converted "fails in two minutes" into "grinds for forty-five
+          # and then fails". Retrying is not a substitute for an endpoint that
+          # can take the load, so the number is only large enough to absorb
+          # ordinary packet loss.
+          solana program deploy \
+            --url "$SOLANA_RPC" \
+            --keypair "$HOME/.solana-keys/deployer.json" \
+            --program-id target/deploy/handsel_market-keypair.json \
+            --use-rpc \
+            --max-sign-attempts 30 \
+            --with-compute-unit-price 1000 \
+            target/deploy/handsel_market.so
+          PID=$(solana address -k target/deploy/handsel_market-keypair.json)
+          {
+            echo "### Deployed to devnet"
+            echo ""
+            echo "- Program: \`$PID\`"
+            echo "- Explorer: https://explorer.solana.com/address/$PID?cluster=devnet"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The question CI could not answer after the fact: is the program on
+      # devnet the build from THIS commit? `solana program deploy` exiting 0
+      # only says an upload finished while the job was watching. Afterwards a
+      # green run whose deploy job never ran looks identical from the outside —
+      # which is how a fix sat in main for hours while the chain still served
+      # the broken binary, under a checkmark.
+      #
+      # `solana program dump` reads the bytes back off the chain. They are the
+      # same ELF, zero-padded to the account's allocated length, so this build
+      # must be a byte-for-byte prefix and the remainder must be zeros. The
+      # deployed slot goes in the summary so the run is checkable later from
+      # the chain alone, without trusting the log.
+      - name: On-chain bytes are this build
+        working-directory: solana
+        run: |
+          PID=$(solana address -k target/deploy/handsel_market-keypair.json)
+          solana program dump --url "$SOLANA_RPC" "$PID" onchain.so
+          LOCAL=$(wc -c < target/deploy/handsel_market.so)
+          LOCAL_SHA=$(sha256sum target/deploy/handsel_market.so | cut -d' ' -f1)
+          CHAIN_SHA=$(head -c "$LOCAL" onchain.so | sha256sum | cut -d' ' -f1)
+          echo "local: $LOCAL_SHA ($LOCAL bytes)"
+          echo "chain: $CHAIN_SHA"
+          [ "$LOCAL_SHA" = "$CHAIN_SHA" ] || {
+            echo "::error::The program at $PID is not this build."
+            exit 1
+          }
+          # The padding has to actually be padding. A non-zero tail means a
+          # longer, different binary that merely starts the same way.
+          TAIL=$(tail -c "+$((LOCAL + 1))" onchain.so | tr -d '\0' | wc -c)
+          [ "$TAIL" -eq 0 ] || {
+            echo "::error::On-chain binary is longer than this build and its tail is not zero padding."
+            exit 1
+          }
+          SLOT=$(solana program show --url "$SOLANA_RPC" "$PID" | sed -n 's/^Last Deployed In Slot: *//p')
+          rm -f onchain.so
+          {
+            echo "- Deployed in slot: \`${SLOT:-unknown}\` (commit \`${GITHUB_SHA:0:7}\`)"
+            echo "- sha256(.so): \`$LOCAL_SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Its own step, and unconditional, because two later steps need it: the
+      # happy path (optional) and the chain read (`always()`). Leaving the
+      # install inside the optional one made the mandatory one depend on a
+      # checkbox.
+      - name: Install the devnet client deps
+        if: always()
+        working-directory: solana
+        run: npm ci --no-audit --no-fund
+
+      - name: Happy path against the live program
+        if: inputs.run_happy_path
+        working-directory: solana
+        run: |
+          # pipefail, and it is not decoration. `cmd | tee` reports TEE's exit
+          # status, so the first run of this step piped a script that threw at
+          # the withdraw step into tee, tee exited 0, and CI called it green.
+          # The chain said otherwise: settlement had credited a ledger nobody
+          # could withdraw from. A check that cannot fail is not a check.
+          set -o pipefail
+          export ANCHOR_PROVIDER_URL="$SOLANA_RPC"
+          export ANCHOR_WALLET="$HOME/.solana-keys/deployer.json"
+          npx tsx scripts/happy-path.ts | tee happy-path.log
+          {
+            echo ""
+            echo "### Happy path"
+            echo ""
+            echo '```'
+            cat happy-path.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # The last word, and `always()` because the state you are left in after a
+      # failure is exactly the state worth reading. Three times this sprint the
+      # thing that settled a green checkmark was a hand-typed
+      # `getProgramAccounts` — so the read is a command now, it runs here, and
+      # it runs the same way on a laptop:
+      #
+      #   node scripts/verify-solana-chain.mjs
+      #
+      # It needs no keys, no toolchain and no IDL. Under `tsx` (which solana/
+      # depends on) it imports the decoder directly.
+      - name: The chain agrees with itself
+        if: always() && env.PROGRAM_ID != ''
+        working-directory: solana
+        run: npx tsx ../scripts/verify-solana-chain.mjs --program "$PROGRAM_ID" --url "$SOLANA_RPC"
+
+      # Runs even when the deploy failed, which is exactly when it matters:
+      # the lamports go back to the deployer instead of sitting in an orphan
+      # account whose seed phrase is now in a public CI log.
+      - name: Reclaim any buffer this run stranded
+        if: always()
+        run: |
+          solana program close --buffers --url "${SOLANA_RPC:-$SOLANA_CLUSTER}" || true
+          solana balance || true
+
+      - name: Shred the keypairs
+        if: always()
+        run: rm -rf "$HOME/.solana-keys"

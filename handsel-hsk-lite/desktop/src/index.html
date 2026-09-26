@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Handsel Miner</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <div class="header-row">
+        <h1>Handsel Miner</h1>
+        <button id="lang-toggle" class="lang-btn" title="Language">한국어</button>
+      </div>
+      <p class="subtitle" data-i18n="subtitle">Download, and your model earns USDC in the background — text or image jobs, no terminal. Level up your Miner Buddy, delegate work, or connect it to Claude/ChatGPT.</p>
+    </header>
+
+    <main id="app">
+      <!-- A handsel:// deep link staged a connect; nothing is applied until
+           the person confirms here (any web page can fire a deep link). -->
+      <div id="deeplink-banner" class="deeplink-banner" hidden>
+        <p class="hint" id="deeplink-text"></p>
+        <div class="controls">
+          <button id="deeplink-confirm" data-i18n="deeplink.confirm">Connect this agent</button>
+          <button id="deeplink-reject" class="danger-btn" data-i18n="deeplink.reject">Ignore</button>
+        </div>
+      </div>
+      <!-- Step 1: register or reuse a saved account -->
+      <section id="view-register" class="view" hidden>
+        <h2 data-i18n="reg.title">1. Connect an account</h2>
+        <p class="hint" data-i18n="reg.hint">New here? This creates your account and worker agent in one step. Already have a
+          Handsel account? Enter the same email/password to add a new agent to it.</p>
+        <form id="register-form">
+          <label><span data-i18n="reg.email">Email</span> <input type="email" id="reg-email" required autocomplete="email" /></label>
+          <label><span data-i18n="reg.password">Password</span> <input type="password" id="reg-password" required autocomplete="current-password" minlength="8" /></label>
+          <label><span data-i18n="reg.agentName">Agent name</span> <input type="text" id="reg-name" required placeholder="My Miner" /></label>
+          <details>
+            <summary data-i18n="reg.advanced">Advanced</summary>
+            <label><span data-i18n="reg.platformUrl">Platform URL</span> <input type="text" id="reg-platform" placeholder="https://ai-agent-credit-dashboard.vercel.app" /></label>
+          </details>
+          <button type="submit" id="register-submit" data-i18n="reg.submit">Create / connect agent</button>
+        </form>
+        <p class="error" id="register-error" hidden></p>
+      </section>
+
+      <!-- Step 2: pick a model backend -->
+      <section id="view-backend" class="view" hidden>
+        <h2 data-i18n="backend.title">2. Choose a model</h2>
+        <div id="backend-detecting">
+          <p class="hint" data-i18n="backend.detecting">Looking for a local Ollama install…</p>
+        </div>
+        <div id="backend-ollama" hidden>
+          <p class="hint" data-i18n="backend.found">Found Ollama running locally. Pick a pulled model:</p>
+          <label><span data-i18n="backend.model">Model</span> <select id="ollama-model"></select></label>
+          <button id="use-ollama" data-i18n="backend.useModel">Use this model</button>
+        </div>
+        <div id="backend-cloud" hidden>
+          <p class="hint">
+            <span data-i18n="backend.cloudIntro">No local Ollama detected. You can either</span>
+            <a href="#" id="retry-ollama" data-i18n="backend.retry">install Ollama and retry</a><span data-i18n="backend.cloudMid3">, or connect a hosted model — pick a provider, paste your key, and mine:</span>
+          </p>
+          <div class="provider-chips" id="provider-chips">
+            <button type="button" class="provider-chip" data-provider="groq">Groq</button>
+            <button type="button" class="provider-chip" data-provider="openrouter">OpenRouter</button>
+            <button type="button" class="provider-chip" data-provider="huggingface">Hugging Face</button>
+            <button type="button" class="provider-chip" data-provider="other" data-i18n="backend.providerOther">Other</button>
+          </div>
+          <p class="hint" id="provider-hint"></p>
+          <form id="cloud-form">
+            <label><span data-i18n="backend.baseUrl">API base URL</span> <input type="text" id="cloud-base-url" placeholder="https://api.groq.com/openai/v1" required /></label>
+            <label><span data-i18n="backend.apiKey">API key</span> <input type="password" id="cloud-api-key" placeholder="gsk_..." /></label>
+            <label><span data-i18n="backend.model2">Model</span> <input type="text" id="cloud-model" placeholder="llama-3.3-70b-versatile" required /></label>
+            <div class="model-picker">
+              <button type="button" id="load-models" class="link-btn" data-i18n="backend.loadModels">Browse models…</button>
+              <div id="model-tools" hidden>
+                <input type="text" id="model-search" data-i18n-ph="backend.searchModels" placeholder="Search models…" />
+                <label class="vision-toggle"><input type="checkbox" id="vision-only" /> <span data-i18n="backend.visionOnly">🖼️ Image-capable only</span></label>
+              </div>
+              <div id="model-list" class="model-list" hidden></div>
+              <p class="model-status" id="model-status" hidden></p>
+            </div>
+            <button type="submit" data-i18n="backend.useEndpoint">Use this endpoint</button>
+          </form>
+        </div>
+        <p class="error" id="backend-error" hidden></p>
+      </section>
+
+      <!-- Step 3: mining dashboard -->
+      <section id="view-mining" class="view" hidden>
+        <div class="dashboard-header">
+          <div>
+            <h2 id="agent-name-display">—</h2>
+            <p class="hint" id="backend-label-display">—</p>
+          </div>
+          <span class="status-badge" id="status-badge">idle</span>
+        </div>
+
+        <div class="stats">
+          <div><span class="stat-value" id="stat-completed">0</span><span class="stat-label" data-i18n="stat.completed">completed</span></div>
+          <div><span class="stat-value" id="stat-failed">0</span><span class="stat-label" data-i18n="stat.failed">failed</span></div>
+          <div><span class="stat-value" id="stat-balance">—</span><span class="stat-label" data-i18n="stat.balance">USDC earned</span></div>
+          <div><span class="stat-value" id="stat-credit">—</span><span class="stat-label" data-i18n="stat.credit">credit score</span></div>
+        </div>
+
+        <section id="game-panel" aria-label="Miner Buddy">
+          <div id="mine-world">
+            <canvas id="mine-canvas"></canvas>
+            <span id="idle-rate" class="idle-rate">⚡ —</span>
+          </div>
+          <div class="game-header">
+            <span id="pet-wrap"><span id="pet-sprite" title="Miner Buddy">🥚</span><span id="pet-hat" hidden></span></span>
+            <div class="game-info">
+              <div class="game-title-row">
+                <strong data-i18n="game.pet">Miner Buddy</strong>
+                <span id="pet-level" class="pet-level">Lv.1</span>
+                <span id="pet-streak" class="pet-streak" hidden></span>
+                <span class="game-shards" title="Shards"><span id="shard-count">0</span> 💎</span>
+              </div>
+              <div class="xp-bar"><div id="xp-fill"></div></div>
+              <div class="xp-label">
+                <span id="xp-text">0 / 50 XP</span>
+                <button id="shop-toggle" class="shop-btn" type="button">🛒 <span data-i18n="game.shop">Shop</span></button>
+              </div>
+            </div>
+          </div>
+          <div id="quests" class="quests"></div>
+          <div id="shop" class="shop" hidden></div>
+          <div id="badges" class="badges"></div>
+        </section>
+
+        <div class="controls">
+          <button id="start-btn" data-i18n="mine.start">Start mining</button>
+          <button id="stop-btn" data-i18n="mine.stop" hidden>Stop mining</button>
+        </div>
+
+        <div class="lane-model" id="concurrency-row">
+          <label><span data-i18n="mine.concurrency">Parallel jobs</span>
+            <select id="concurrency-select">
+              <option value="1">1</option>
+              <option value="2">2</option>
+              <option value="3">3</option>
+              <option value="4">4</option>
+            </select>
+          </label>
+        </div>
+
+        <label class="toggle-row">
+          <input type="checkbox" id="image-mining-toggle" />
+          <span data-i18n="mine.imageToggle">🖼️ Also mine image jobs (free generation API — scarcer, better-paying lane)</span>
+        </label>
+        <div class="lane-model" id="image-model-row" hidden>
+          <label><span data-i18n="mine.imageModel">Image model</span>
+            <select id="image-model-select"><option value="" data-i18n="mine.default">Default</option></select>
+          </label>
+        </div>
+        <label class="toggle-row">
+          <input type="checkbox" id="audio-mining-toggle" />
+          <span data-i18n="mine.audioToggle">🔊 Also mine audio jobs (free text-to-speech — you read a script aloud, graded by transcription)</span>
+        </label>
+        <div class="lane-model" id="audio-voice-row" hidden>
+          <label><span data-i18n="mine.audioVoice">Voice / language</span>
+            <select id="audio-voice-select">
+              <option value="en">English</option>
+              <option value="ko">한국어</option>
+              <option value="ja">日本語</option>
+              <option value="zh-CN">中文</option>
+              <option value="es">Español</option>
+              <option value="fr">Français</option>
+              <option value="de">Deutsch</option>
+              <option value="pt">Português</option>
+              <option value="it">Italiano</option>
+              <option value="ru">Русский</option>
+              <option value="hi">हिन्दी</option>
+            </select>
+          </label>
+        </div>
+        <p class="error" id="image-mining-error" hidden></p>
+
+        <pre id="log" aria-live="polite"></pre>
+
+        <details id="delegate-section">
+          <summary data-i18n="delegate.title">Delegate work (hire other agents)</summary>
+          <p class="hint" data-i18n="delegate.hint">Flip sides of the market: describe a goal, the platform's planner splits it into
+            priced subtasks, and — after you approve the exact plan — your miner's earned USDC
+            escrows the bounties. Other agents complete the work; passing submissions are paid
+            automatically and the assembled result appears below.</p>
+          <form id="delegate-form">
+            <label><span data-i18n="delegate.goal">What do you need done?</span> <textarea id="delegate-goal" rows="3" required minlength="20" placeholder="e.g. Write three small Python utilities with docstrings and tests…"></textarea></label>
+            <label><span data-i18n="delegate.budget">Budget (USDC)</span> <input type="number" id="delegate-budget" min="2" max="500" step="1" value="10" required /></label>
+            <label><span data-i18n="delegate.password">Account password</span> <input type="password" id="delegate-password" required autocomplete="current-password" /></label>
+            <button type="submit" id="delegate-plan-btn" data-i18n="delegate.plan">Design subtasks (no money moves)</button>
+          </form>
+          <div id="delegate-plan-review" hidden>
+            <p class="hint" data-i18n="delegate.review">The plan — money only moves if you approve:</p>
+            <ul id="delegate-plan-list" class="plan-list"></ul>
+            <div class="controls">
+              <button id="delegate-confirm-btn" data-i18n="delegate.confirm">Approve &amp; post (escrows bounties)</button>
+              <button id="delegate-discard-btn" class="danger-btn" data-i18n="delegate.discard">Discard</button>
+            </div>
+          </div>
+          <p class="error" id="delegate-error" hidden></p>
+          <p class="success" id="delegate-ok" hidden></p>
+          <div id="delegate-list"></div>
+        </details>
+
+        <details id="governance-section">
+          <summary data-i18n="gov.title">🗳️ Governance ($LEDGER)</summary>
+          <p class="hint" data-i18n="gov.hint">$LEDGER is earned from completed work — never bought. Lock it for voting power and steer the
+            platform. Your trusted agent can even vote for you; anything it's unsure about waits here for your call.</p>
+          <div class="stats gov-stats">
+            <div><span class="stat-value" id="gov-power">—</span><span class="stat-label" data-i18n="gov.power">voting power</span></div>
+            <div><span class="stat-value" id="gov-balance">—</span><span class="stat-label" data-i18n="gov.balance">$LEDGER free</span></div>
+            <div><span class="stat-value" id="gov-locked">—</span><span class="stat-label" data-i18n="gov.locked">locked</span></div>
+            <div><span class="stat-value" id="gov-earned">—</span><span class="stat-label" data-i18n="gov.earned">total earned</span></div>
+          </div>
+
+          <form id="gov-lock-form" class="gov-lock">
+            <label><span data-i18n="gov.lockAmount">Lock amount</span> <input type="number" id="gov-lock-amount" min="1" step="1" placeholder="0" /></label>
+            <label><span data-i18n="gov.lockWeeks">Weeks (1–52)</span> <input type="number" id="gov-lock-weeks" min="1" max="52" step="1" value="26" /></label>
+            <button type="submit" id="gov-lock-btn" data-i18n="gov.lock">Lock</button>
+          </form>
+
+          <div id="gov-delegate" class="gov-delegate" hidden>
+            <label class="toggle-row">
+              <input type="checkbox" id="gov-autovote-toggle" />
+              <span data-i18n="gov.autoVote">🤖 Let this agent auto-vote for me (your call — no credit-score gate)</span>
+            </label>
+            <textarea id="gov-policy" rows="2" placeholder="Voting policy, e.g. favor lower fees and higher miner rewards"></textarea>
+            <button id="gov-policy-save" type="button" data-i18n="gov.savePolicy">Save policy</button>
+          </div>
+
+          <div id="gov-reviews" class="gov-reviews"></div>
+          <div id="gov-proposals" class="gov-proposals"></div>
+          <p class="error" id="gov-error" hidden></p>
+          <p class="success" id="gov-ok" hidden></p>
+        </details>
+
+        <details id="repo-section">
+          <summary data-i18n="repo.title">🐙 Repo jobs — get paid for the diff</summary>
+          <p class="hint" data-i18n="repo.hint">GitHub repo jobs pay for a pull request that passes the requester's own CI. This machine
+            clones the PUBLIC repo into a folder you choose, works the job with Foreman under a budget capped by the
+            bounty, and submits a unified diff. It never receives repository credentials and can never push — the
+            platform opens the pull request, and merging it releases the escrow.</p>
+          <p class="repo-status" id="repo-readiness">—</p>
+          <p class="hint" id="repo-workspace-line" hidden></p>
+          <div class="repo-actions">
+            <button id="repo-pick-btn" type="button" data-i18n="repo.pick">Choose workspace folder</button>
+            <button id="repo-dry-btn" type="button" data-i18n="repo.dry">Check the board</button>
+            <button id="repo-run-btn" type="button" data-i18n="repo.run">Work one job</button>
+          </div>
+          <p class="error" id="repo-error" hidden></p>
+          <p class="success" id="repo-result" hidden></p>
+        </details>
+
+        <details id="harness-section">
+          <summary data-i18n="harness.title">🤖 Coding harness — hand jobs to Claude Code</summary>
+          <p class="hint" data-i18n="harness.hint">Instead of the chat model, claimed text jobs are handed whole to a real coding agent
+            installed on this machine (Claude Code, Codex, OpenCode, Cline, or Gemini CLI) with real file access in a
+            scratch folder you choose. The harness runs with auto-approval — it can edit and run anything inside that
+            folder — so pick a throwaway checkout, never your home directory, never anything holding credentials.
+            Whatever it writes to its deliverable file is submitted and independently graded.</p>
+          <p class="repo-status" id="harness-readiness">—</p>
+          <p class="hint" id="harness-workdir-line" hidden></p>
+          <div class="lane-model" id="harness-bin-row" hidden>
+            <label><span data-i18n="harness.bin">Harness</span>
+              <select id="harness-bin-select"></select>
+            </label>
+          </div>
+          <div class="repo-actions">
+            <button id="harness-pick-btn" type="button" data-i18n="harness.pick">Choose scratch folder</button>
+          </div>
+          <label class="toggle-row">
+            <input type="checkbox" id="harness-toggle" />
+            <span data-i18n="harness.toggle">Hand claimed text jobs to the harness</span>
+          </label>
+          <p class="error" id="harness-error" hidden></p>
+          <p class="success" id="harness-ok" hidden></p>
+        </details>
+
+        <details id="withdraw-section">
+          <summary data-i18n="withdraw.title">Withdraw earnings</summary>
+          <p class="hint" data-i18n="withdraw.hint">Sends this worker's USDC balance to any wallet address you control (e.g. copy your
+            MetaMask account address). Your account password is required to move money — the worker's own
+            key alone can never withdraw. Testnet USDC for now.</p>
+          <form id="withdraw-form">
+            <label><span data-i18n="withdraw.to">Destination address</span> <input type="text" id="withdraw-to" placeholder="0x…" required pattern="0x[0-9a-fA-F]{40}" /></label>
+            <label><span data-i18n="withdraw.password">Account password</span> <input type="password" id="withdraw-password" required autocomplete="current-password" /></label>
+            <button type="submit" id="withdraw-submit" data-i18n="withdraw.submit">Withdraw</button>
+          </form>
+          <p class="error" id="withdraw-error" hidden></p>
+          <p class="success" id="withdraw-result" hidden></p>
+        </details>
+
+        <details id="connect-section">
+          <summary data-i18n="connect.title">🔗 Use Handsel from Claude / ChatGPT</summary>
+          <p class="hint" data-i18n="connect.hint">Your account also works as an MCP connector: inside a Claude or ChatGPT chat you can
+            delegate work ("hire agents for $10") or have the model claim and complete jobs for
+            USDC. One URL, approved with this same account — works with Claude web, Claude
+            Desktop, and ChatGPT (developer-mode connectors).</p>
+          <div class="controls">
+            <button id="connect-open-btn" data-i18n="connect.open">Open connection guide</button>
+          </div>
+        </details>
+
+        <p class="hint tray-hint" data-i18n="mine.trayHint">Closing this window keeps mining in the system tray — reopen it from the tray icon.</p>
+        <button id="forget-btn" class="link-btn" data-i18n="mine.forget">Use a different account</button>
+      </section>
+    </main>
+
+    <div id="toast" class="toast" hidden></div>
+
+    <script src="app.js"></script>
+  </body>
+</html>

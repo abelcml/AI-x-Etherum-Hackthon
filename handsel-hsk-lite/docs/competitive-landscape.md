@@ -1,0 +1,1031 @@
+# Competitive landscape — who else is building agent trust, and where Handsel sits
+
+*Last updated: 2026-07. Written for our own honesty first, investor/GASOK
+diligence second: overlaps are stated at full strength, not lawyered down.*
+
+The one-line positioning up front: **most projects in this space build agent
+identity, agent payments, OR an agent marketplace. Handsel's bet is the
+missing fourth layer — credit underwriting: turning independently verified
+work history into a borrowing capacity (score → rating → limit → draw →
+repay). Nobody listed below closes that loop today.**
+
+One correction to that framing, added after the fact: §6 covers a market that
+has nothing to do with agents — GitHub-native bounties — because that is where
+the `repo-jobs` lane actually ships. It was missing from this document for as
+long as the lane has existed, which is a reminder that the competitive set is
+decided by what you built, not by the category you filed yourself under.
+
+---
+
+## 1. Agent identity & reputation standards
+
+### ERC-8004 "Trustless Agents" — the most important thing on this page
+Ethereum standard (proposed Aug 2025, live implementations on mainnet and
+several L2s/chains through 2026) defining three on-chain registries:
+Identity (ERC-721 agent identities), Reputation (standardized feedback
+signals), and Validation (hooks for validator contracts to publish
+results). Adopted by Avalanche, BNB Chain, and on the EF's 2026 roadmap.
+
+- **Overlap**: their three registries are conceptually our agent registry +
+  behavioral ledger + grading pipeline, as a neutral standard.
+- **Difference**: ERC-8004 standardizes the *interfaces* for reputation; it
+  deliberately doesn't define how reputation is computed, what it's worth,
+  or what you can borrow against it. It's plumbing, not underwriting.
+- **Our move**: this is not a competitor — it's a compatibility target.
+  A Handsel credit score published *into* an ERC-8004 Reputation/
+  Validation registry becomes portable and composable, and we become a
+  "credit oracle" in their ecosystem rather than an island. Implemented
+  and env-gated (`lib/onchain/erc8004.ts`); awaiting a registry
+  deployment on the target chain.
+
+### Skyfire — "Agent Passports"
+Verified identity + payment credentials for agents; passports carry
+reputation/spending history across platforms so vendors can screen agents.
+
+- **Overlap**: reputation-that-gates-commerce, same instinct as our
+  min-score job gating.
+- **Difference**: identity/KYA + payments trust layer; no independent
+  verification of *work quality*, no lending.
+
+---
+
+## 2. Agent-to-agent labor & commerce markets
+
+### Virtuals Protocol / ACP — the closest functional competitor
+The largest agent economy (18k+ agents claimed); its Agent Commerce
+Protocol runs request → negotiation → escrow → **evaluation by evaluator
+agents** → settlement, across multiple chains, with evaluators earning a
+share of transaction value.
+
+- **Overlap**: this is our Labor Market's shape — escrow plus an evaluator
+  that isn't the worker. Their "market for specialized evaluation agents"
+  is a decentralized version of what our platform runtime does centrally.
+- **Difference**: (1) evaluation in ACP is itself agent-judgment — an
+  evaluator LLM's opinion, with the same confidently-wrong exposure our
+  quality_score has; our graded-fact class (exact-match answers,
+  requester-authored test execution) is mechanically checkable, not
+  opinion. (2) ACP's output is per-transaction settlement; nothing
+  compounds into a credit line an agent can draw against. (3) Scale:
+  they are years and thousands of agents ahead — no point pretending
+  otherwise.
+- **What to steal**: evaluator-as-a-market (paid, reputation-scored
+  evaluators) is roughly where our issue #7 design is heading anyway.
+
+### Olas — Mech Marketplace
+Agents hiring agents for tasks, 11M+ a2a transactions across nine chains
+(Q1 2026 figures). Proven demand for agent-to-agent work.
+
+- **Difference**: payment-for-service without independent quality grading
+  or credit accumulation; reputation is usage-based, not verification-based.
+
+### Recall Network
+Competition network that ranks agents via live, verifiable competitions
+(e.g. verifiable trading arenas with EigenCloud).
+
+- **Overlap**: closest philosophical neighbor to our Proving Ground —
+  capability demonstrated under controlled, verifiable conditions rather
+  than self-reported.
+- **Difference**: rankings/discovery are the end product; we treat the
+  verified event as an *input to underwriting*.
+
+---
+
+## 3. Agent payment rails (complementary, not competing)
+
+- **x402** — HTTP-402 stablecoin micropayments, Linux Foundation project
+  (2026) backed by AWS/Google/Stripe/Visa/Mastercard/Amex. If agent
+  payments standardize here, our draws/repayments/payouts should
+  eventually speak it.
+- **Payman** — spend management/budget caps for agents (our
+  WALLET_MAX_TX_USD / daily-cap logic as a product).
+- These make agent *spending* safe. None of them decide whether an agent
+  *deserves* a credit line — that's upstream of them, where we sit.
+
+## 4. Agent credit & lending — the thin field we're actually in
+
+Early 2026 saw the first experiments in underwriting loans against an
+agent's on-chain economic activity, and middleware maintaining behavioral
+score vectors per agent (e.g. ACHIVX's seven-dimension model) for banks
+evaluating agent trust. The category exists, is young, and is mostly
+*analytics* — scoring as a report, not scoring wired to an enforceable
+on-chain limit with draw/repay/default consequences feeding back into the
+score. That closed loop is Handsel's specific claim, and as far as we
+can tell it remains rare enough to be a real wedge.
+
+(One anonymous reviewer referenced a "NEXUS" agent-credit design family in
+a private message; we could not identify a real project by that name —
+noted here for completeness, not as evidence.)
+
+## 5. DePIN / decentralized compute — the adjacent giant
+
+Bittensor, io.net, Akash, Render, Nosana: idle GPUs earning again. The
+structural difference we hammer in the pitch deck: **they bill for GPU
+time because time is trivial to verify and quality isn't; mining paid for
+hashes, they pay for hours, we pay for work being right.** Gensyn is the
+interesting outlier — cryptographic verification that ML *computation* was
+performed as specified (reproducible execution) — but it verifies the
+computation, not the usefulness of the deliverable to a requester.
+
+## 6. GitHub-native bounty markets — where the repo-jobs lane actually competes
+
+Sections 1–5 are the agent-economy framing. But the `repo-jobs` lane
+(`docs/github-jobs.md`) ships into a market that already exists and has
+nothing to do with agents: **paying for a GitHub issue to get closed.** This
+section was missing until a stranger forked this repo alongside
+`ubiquity/research`, which was a fair hint that the comparison set here is
+not the one we had written down.
+
+Two distinct incumbents, and our lane is the intersection of them — which is
+the strongest thing about the position and also the reason both sides can
+eat it.
+
+### 6a. Bounty-on-an-issue platforms (money, human workers)
+
+**UbiquityOS / Ubiquity DAO.** The closest thing to our label-to-bounty bot
+that actually exists. Label a GitHub issue with a price and their bot pays
+the contributor in crypto when the issue closes — xDAI to a wallet or USD to
+a card, with comment incentives and XP on top. Around it sits a real
+payments stack (`pay.ubq.fi` permit generation, `checkout.ubq.fi`) and a
+"DevPool" contributor funnel.
+
+**Algora.** The same primitive with a US-fintech spine instead of a DAO one:
+`/bounty $1000` as an issue comment, and they handle payouts, compliance and
+1099s. Their pitch has drifted toward hiring — bounties as an audition for
+contract and full-time work.
+
+- **Overlap**: the trigger gesture is identical. A human writes a price onto
+  an issue and money is committed to whoever resolves it. If someone only
+  wanted "label an issue, pay a contributor", both are more mature than us
+  and one of them handles tax forms.
+- **Current activity (checked 2026-07-27).** Separate axis from maturity, and
+  worth tracking on its own: UbiquityOS's core repos (kernel, plugin-sdk,
+  plugin-template) were last pushed **2026-04-21/22**, roughly three months
+  ago; the UbiquityOS topic in their Telegram has been silent since
+  **2025-04**; and their plugins-wishlist carries an open issue titled *"15+
+  days no maintainer response"* from 2026-05, with most issues there opened by
+  org members rather than outsiders. A quiet project, not an abandoned one —
+  April is recent and small teams go quiet. Algora looks the livelier of the
+  two, with bounty awards through **May–June 2026**. These dates are the most
+  perishable claims in this section; re-check before quoting them.
+- **Difference (1) — when the money is committed.** Both are pay-on-outcome:
+  the funder is trusted to be good for it, and the contributor claims
+  afterwards. Ours escrows at posting time, on-chain, before any worker sees
+  the job. That is worse UX and a strictly stronger promise, and it is the
+  only reason a *machine* can safely take the work — an agent cannot chase
+  an invoice.
+- **Difference (2) — what closes the loop.** Theirs pays on issue close.
+  Ours pays on **merge**, deliberately: CI green never moves money, because
+  green tests on a bad diff is exactly the failure a bounty market invites —
+  though the repo-jobs lane currently runs on the testnet deployment only
+  (the GitHub App is not configured on mainnet).
+- **Difference (3) — what accumulates.** Theirs accumulates a payment
+  history. Ours accumulates an underwritten credit score that unlocks
+  borrowing. That is the whole thesis and neither of them is trying to do it.
+- **Honest caveat**: I have not read Ubiquity's escrow internals. "Permit
+  generation" strongly implies claim-after-the-fact rather than lock-up-front,
+  but this is inference from their public repo names, not verification.
+
+### 6b. Autonomous coding agents (workers, no market)
+
+**GitHub Copilot coding agent** is the one that matters. Assign it an issue
+and it works in a GitHub Actions sandbox, explores the repo, writes code,
+runs tests, and opens a PR for review — with CodeQL, secret scanning and
+dependency review built in, and MCP integration for pulling external
+context. Devin, OpenHands/SWE-agent and Codegen occupy the same slot with
+different distribution.
+
+- **Overlap**: this is our worker, and it is first-party to the platform our
+  jobs live on. For the specific act of turning an issue into a PR, Copilot's
+  coding agent is better resourced than anything claiming a job from our
+  board, and it is one click from where the issue already is.
+- **Difference**: it is a **worker without a market**. There is no price on
+  the issue, no escrow, no counterparty, no independent grader, and no record
+  that transfers anywhere. It does work for the repo that pays for its seat.
+  Nothing about it lets an unknown third-party agent bid for the job and be
+  trusted with it.
+- **Where this actually lands**: Copilot's agent is a plausible *supplier* to
+  our market, not only a competitor — the same way `foreman` is. A market
+  whose workers include first-party coding agents is a better market. The
+  thing we must not do is compete with it on raw diff quality.
+
+### The intersection, stated plainly
+
+Neither half has the other's piece. Bounty platforms have a market with human
+workers and no verification layer that a machine could be graded by. Coding
+agents have machine workers with no market, no escrow, and no portable record.
+Handsel's repo-jobs lane claims the intersection: **an escrowed price on an
+issue, an arbitrary agent taking it, an independent grade, merge as the only
+release trigger, and a score that follows the worker to the next job.**
+
+The risk in that sentence is that an intersection is defensible only while
+both sides ignore it. UbiquityOS adding agent workers is a smaller step than
+us building their payments maturity; GitHub adding a price field to issues is
+a smaller step still.
+
+## 7. Dispute-resolution prior art (design inputs for issue #7)
+
+- **Kleros** — staked, incentive-compatible juror courts with appeal
+  escalation.
+- **UMA Optimistic Oracle** — assertions stand unless disputed within a
+  window; bonds punish wrong disputes.
+- **Reality.eth** — escalating-bond answer market.
+
+These are the reference architectures for replacing our single-EOA
+arbiter; our addition (per issue #7 discussion) is domain-scoped reviewer
+reputation computed by the same behavioral engine that scores workers.
+
+---
+
+## Honest threat ranking
+
+1. **Virtuals ACP** — could add credit/underwriting on top of their scale
+   faster than we can build scale under our underwriting.
+2. **ERC-8004 ecosystem** — if reputation becomes a commodity standard,
+   the moat moves entirely to underwriting quality and verified-grading
+   supply; good for us only if we integrate early.
+3. **A well-funded fintech** entering agent credit top-down (bank-style
+   scoring per ACHIVX direction) with compliance resources we lack.
+4. **GitHub itself**, to the repo-jobs lane specifically. A price field on an
+   issue plus the coding agent it already ships would be most of our GitHub
+   story, first-party, with distribution we cannot approach. Our answer has
+   to be the part GitHub structurally will not build: an *open* market where
+   the worker is a stranger and the grade is what makes them trustable.
+5. **UbiquityOS / Algora adding agent workers.** Bolting agents onto an
+   existing bounty market is a shorter path than bolting a payments-and-
+   compliance business onto ours. Their missing piece is grading; ours is
+   maturity and users. Ranked 5th rather than higher on current activity
+   (§6a), not on how short the path is: the path really is short, but a
+   project three months between pushes is not walking it today. Algora is the
+   live half of this row.
+
+## Why we still think the wedge is real
+
+- Verified-work grading (ground truth + test execution) as the *input*,
+  enforceable on-chain limits as the *output*, and repayment behavior
+  feeding back — no one listed runs all three.
+- Solo-buildable surface today; standards (ERC-8004, x402) are arriving
+  exactly when we'd need portability.
+- The failure modes everyone else defers ("who grades the grader",
+  "confidently wrong", Sybil resets) are already our public issues (#6,
+  #7) — being early on the hard part is the moat a small team can afford.
+- The repo-jobs lane sits on an intersection nobody occupies (§6): bounty
+  platforms have a market without machine-gradeable verification, coding
+  agents have machine workers without a market. Thin ice, but ice.
+
+*Sources for §6, checked 2026-07: github.com/ubiquity and the Ubiquity Bounty
+Bot marketplace listing; algora.io; the GitHub blog post on assigning issues
+to the Copilot coding agent. Everything attributed to a competitor here is
+from public material — where I am inferring rather than reporting, the text
+says so.*
+
+
+---
+
+# Second pass, 2026-08-03
+
+*Prompted by a landscape summary that arrived from outside. Roughly half
+survived checking, and the half that did not is the more useful half. Every
+project below was confirmed to exist before being written down; the two EIPs
+were read from the spec text rather than from commentary; single-source claims
+are marked as reported rather than verified.*
+
+## The framing this pass corrects
+
+The July version leads with the wedge as *"credit underwriting"*. That is the
+phrase `docs/product-thesis.md` — written a few days later, after an outside
+critique — explicitly rejects:
+
+> *Not "credit for AI agents". That phrase is **true and useless**: it
+> describes a market that mostly does not exist in 2026, and it buries the one
+> case here that is real and checkable.*
+
+The defensible claim is narrower: **an escrow-collateralized advance to a
+prime contractor, where the score prices execution risk and therefore sets
+LTV.** Nothing in the table below is making that claim. The broad one, several
+of them are.
+
+## ERC-8183 — the standard that arrived on top of what we built
+
+New since the July pass, and the more consequential of the two EIPs.
+Virtuals Protocol with the Ethereum Foundation. It standardises the **Job
+primitive**: client, provider, evaluator, escrowed budget, lifecycle
+`Open → Funded → Submitted → {Completed, Rejected, Expired}`, evaluator alone
+may complete. ([EIP-8183](https://eips.ethereum.org/EIPS/eip-8183) ·
+[context](https://cryptobriefing.com/erc-8183-virtuals-protocol-ethereum-ai-agent-commerce/))
+
+That is LaborMarketV2's shape. Which is not a threat to anything the thesis
+claims — *"the asset is the ledger, not the score"* — and is a reason to speak
+the vocabulary instead of competing with it.
+
+`lib/onchain/erc8183.ts` is the projection, with the gap analysis in its
+header. The summary:
+
+| | Cost |
+|---|---|
+| **V2 → 8183** (export) | A pure function. Every V2 job projects into an 8183 state. Shipped. |
+| **8183 → V2** (conform inbound) | A new contract. 8183 has the client *assign* a provider; this market has the worker *claim* one, behind a credit gate, staking a bond. That is the mechanism, not the interface. |
+
+Three things the standard cannot represent, which the projection reports
+rather than drops:
+
+- **The worker bond.** 8183 has no state between funded and submitted, because
+  its model is procurement — the client picks the provider, so nothing needs to
+  make claiming costly. The bond is this market's Sybil resistance on the
+  supply side, and it is invisible in 8183.
+- **The dispute process.** `Disputed` projects to `Submitted`, which is the
+  right lifecycle position (delivered, evaluator has not ruled) and loses the
+  procedure.
+- **The word *Expired*.** 8183 defines it with one beneficiary — "escrow
+  refunded to client after timeout". V2's three routes to the same terminal
+  state settle to three different parties: `expireOpen` refunds the requester
+  in full, `expireReview` **splits** (10% forfeit to the worker side, 90%
+  refunded), and `expireDispute` releases to the **worker** in full. One
+  terminal word covering a refund, a partial forfeit and a full release.
+
+## ERC-8004 — the July call now has evidence
+
+July called 8004 "the most important thing on this page" and treated
+portability as the arriving tailwind. `docs/product-thesis.md` then argued the
+opposite from first principles:
+
+> *If identity is free, a portable reputation is **portable for the forger
+> too**. Portability and Sybil resistance are not two problems. They are one
+> problem, and portability makes it worse.*
+
+An empirical study of the deployed 8004 ecosystem has since found a
+substantial share of registered agents inactive or non-functional, and named
+**reputation gaming and Sybil attacks** as the critical vulnerabilities —
+concluding that *"decentralized verification mechanisms alone may prove
+insufficient"*. ([arXiv 2606.26028](https://arxiv.org/abs/2606.26028))
+
+Prediction and measurement agree. Two cautions on using that:
+
+1. The paper says the ecosystem is gameable, **not that anyone solved it**.
+   Handsel has not. `docs/self-sybil.md` is an admission, not a defence.
+2. The July claim that standards are "arriving exactly when we would need
+   portability" now reads as the wrong wish. What is arriving is the surface
+   this project decided not to build on, and being right about that is worth
+   more than the interop would have been.
+
+## Kojiru — the nearest product, and closer than expected
+
+Not in the July pass. Positioned as credit infrastructure for agents.
+([source](https://finbold.com/fico-was-built-in-1989-ai-agents-need-a-score-for-2026/)
+— one article, so details are reported rather than verified)
+
+| | Kojiru | Handsel |
+|---|---|---|
+| Chain | Base mainnet | Base mainnet |
+| Score range | 300–850 | 300–850 |
+| Primary axis | *Operational Integrity* — probability of successful task completion | Execution risk, from graded outcomes |
+| Model | Recursive Bayesian, updated per task | Rule-based + sample-size damping (`lib/credit-engine/scoring.ts`) |
+| Lending | Collateralized, per-task escrow vault | Collateralized, draw against posted USDC |
+| Lender side | Bilateral lines; the funding lender bears the default | **Not built** — nothing consumes `advanceLimit` |
+| Contracts on Base | **8, verified deployed** (`eth_getCode`, 2026-08-03) | `LaborMarketV2` + registry |
+| Formal verification | halmos (path in their bundle); *Certora* is the article's word and is unconfirmed | Slither + Mythril, dispositioned |
+| Usage published | none found | 17 agents, $0.06 credit line |
+| Sybil | not addressed in the source | `docs/self-sybil.md`, unsolved |
+
+**The core insight converged.** Kojiru's first axis is *probability of
+successful task completion*; the thesis independently reached *"execution risk
+is what a record of graded outcomes actually measures"*. Two teams landing in
+the same place is evidence the place is right.
+
+**Both are collateralized, and that is the sharp observation.** Kojiru's
+capital flows into a vault tied to one task and releases on evaluator
+confirmation; the agent never holds general funds. So the thesis's own line
+applies to them at full strength:
+
+> *A loan against observable collateral does not need a credit score — it needs
+> an escrow lookup.*
+
+Two agent-credit protocols on Base both quietly collateralize everything, and
+both therefore have a score doing less work than the pitch implies. The
+difference is not architectural — **one of us wrote it down.** That comparison
+is only usable because it is self-implicating first.
+
+**Their per-task escrow is itself a partial Sybil answer**, and a good one: a
+forged score buys a credit line, but funds only ever land in a vault an
+evaluator releases. Worth borrowing the thinking from even while the
+portable-score half looks exposed.
+
+**Ahead of us:** the lender side exists, symbolic execution (halmos) beats
+Slither+Mythril, and
+they have a capital-attraction path (published staking APY). **Behind us:** no
+published usage, and no public accounting of what their evaluator network
+costs in trust — every project here relocates trust to an evaluator, and this
+is still the only one that shows the invoice (`GRADER_WEIGHTS`, and the hole
+in it).
+
+### Correction, same day: I checked, and my scepticism was wrong
+
+The section above was written from one article, and I flagged the risk that
+finbold runs placed content and that Kojiru might be pre-launch marketing.
+That was wrong, and the correction belongs next to the claim rather than in a
+changelog.
+
+Checked directly, 2026-08-03:
+
+- **kojiru.com is live** — a Base miniapp (Farcaster frame metadata, Base
+  `app_id`).
+- **Eight contracts are deployed on Base mainnet.** Addresses lifted from
+  their production JS bundle and each confirmed with `eth_getCode` against
+  `mainnet.base.org`: seven with 5–10 KB of bytecode, one small (proxy-shaped).
+  None respond to `name()`/`symbol()`, so they are protocol contracts rather
+  than a token. **The "8 contracts" claim is real**, and the count matches.
+- **Formal verification is real but differently named.** Their bundle
+  references `contracts/formal-verification/halmos/`. halmos is symbolic
+  execution, not Certora; the article says Certora. Recorded as halmos with
+  the discrepancy noted, because guessing which one is right would repeat the
+  mistake this correction exists for.
+- **The GitHub repo their own bundle links to is not publicly reachable.**
+  `github.com/faulknerwayne73-droid/kojiru-platform` returns 404 through one
+  fetch path and 403 through another, and is not in search indexes. Either
+  private or gone — while shipping in production JS either way. So the outreach
+  route is email (`wayne@kojiru.com`, `security@kojiru.com`), not an issue.
+
+What this changes about the assessment: **the biggest claim checked out.**
+"Usage published: none found" still stands — contracts deployed is not
+activity, and no agent count or volume was published. But "deployed on Base
+mainnet" is now verified rather than reported, and it was the load-bearing one.
+
+Worth keeping as a method note: the check that settled it was `eth_getCode`
+against the chain, not more reading. Same instinct as `npm run verify:solana`
+— when a claim is about a chain, the chain is cheaper to ask than the internet.
+
+### Catching up: what the 8183 thread is actually building
+
+*Read #300–#358 on 2026-08-03. The first pass read page 1 (20 posts of 358) and
+drew conclusions from it, which is how the correction below happened. Recorded
+because "I read the thread" and "I read the first page" are different claims and
+only one of them was true.*
+
+**Correction: the worker bond is not ours alone.** The previous section framed
+provider collateral as the thing 8183 cannot see and implied it was distinctive.
+It is under active discussion — @honeytones opened it at #341 (*"the client
+funds everything and the provider risks nothing"*), @pipavlo82 agreed at #343
+that it should not be ruled out, and #348 mentions `workerbond 6 added in v2` in
+a shipped storage layout. At least one other implementation already has it. What
+is still ours to contribute is the *numbers* (5% + $0.03, slashed on
+abandonment, live) and the observation that a bond changes **who shows up**
+rather than improving work quality — not the idea.
+
+**The digest chain, and a correction to what `reason` is for.** #301–#316
+converge on `commitmentHash → verificationDigest → job.reason`, with ERC-8274
+(*AI Inference Proof Verification Interfaces*, PR #1771 on `ethereum/ERCs`)
+defining `IAgentVerifier.verify()` as the producer. The requirement they settled
+on is that `reason` be **deterministic and independently recomputable** from the
+task and agent identifiers — explicitly *not* an opaque blob.
+
+That kills an idea from the previous pass. It suggested `reason` was "where the
+work proof CID goes". A CID is a **pointer**, not a recomputation: an observer
+holding one must fetch something and trust whoever serves it. The thread's
+direction is strictly better and we should follow it rather than the standard
+following us.
+
+**`IAgentVerifiable`, soft declaration** (#309–#312): the settlement contract
+exposes `getAgentVerifier()`, resolved at settlement time; the registry handles
+staking and slashing and never learns verifier addresses. The reasoning — that
+coupling verifier registration to staking makes every new verifier type a
+registry upgrade — is worth keeping whatever we do with 8183.
+
+### Two things worth taking, from #320–#340
+
+Both are ours already, arrived at from a different direction and named better.
+Adopting the vocabulary is cheap and adopting the sharper version of an argument
+you already hold is the whole point of reading other people's threads.
+
+**1. "Stake, not truth."** #321–#322 draw the line between what re-derives and
+what does not: the settlement fact recomputes from chain, the evaluator's
+compliance ratio does not — *"it is an evaluator's commitment that money moved
+on it, non-repudiable, not correct."*
+
+That is `docs/product-thesis.md`'s argument — *"a signed proof verifies
+provenance, not quality... verifiability relocates trust to the grader set"* —
+in four words. Take the phrasing.
+
+**2. "A timing state must never collapse into a validity state."** #324–#325.
+not-yet-committed is a fact about *when you looked*; not-admitted is a fact
+about *whether the record is real*. @pipavlo82's note at #325 is the part that
+stings: he had been deriving it case by case — *stale versus rejected,
+not-yet-committed versus not-admitted, could-not-check versus did-not-match*.
+
+**So have we, everywhere, for months, without ever naming it:**
+
+| Where | The case |
+|---|---|
+| `GET /api/tasks` 503 | "no open jobs" vs "I could not read the market" |
+| `checkMarketInvariants` | an unread vault balance fails the solvency check rather than passing it |
+| `/challenge` read state | `ok` / `unconfigured` / `unreachable` |
+| `readJobsOrUnknown` | the three-valued read the two-valued one replaced |
+| `failure-modes.md` §12 | `catch(() => [])` — when "I can't see" becomes "there's nothing there" |
+| `decodeJobAccount` | an unknown status variant returns null instead of a guess |
+
+Six independent instances of one invariant, each fixed on its own. That is the
+argument for adopting the sentence: the next instance gets recognised before it
+ships instead of after.
+
+### The one that bites: scores have no comparability class
+
+#338–#340 close the loop with a rule about aggregates:
+
+> Any aggregate that can be consumed by a higher-order fold must itself remain a
+> first-class, class-carrying, independently recomputable object, with its
+> inclusion set and pre-aggregation breakdown preserved.
+
+Applied to reputation (#329): entries decided under different pinned policy
+versions belong to **different comparability classes and must not be folded into
+one score silently.**
+
+**The credit score is a fold, and it carries no class.** `agent.creditScore` is
+a bare decimal; `credit_scores` rows carry a `calculationReason` string and no
+engine version. And this is not hypothetical — the scoring engine changed this
+week. Anchoring `dampen()` at 0 and counting deliveries rather than attempts
+moved a one-job agent from 673 to 394. Both numbers can sit in that column, both
+render identically on a public page, and nothing distinguishes them.
+
+`failure-modes.md` §20 already recorded the narrower version — *changing a
+formula does not change stored results*, fixed with a backfill endpoint. The
+thread's rule is stronger and the difference matters: a backfill makes old rows
+current, but it cannot make a **historical** score comparable, and it silently
+destroys the record of what was believed at decision time. A stamped engine
+version fixes both, and it is one column.
+
+That is the most actionable thing this landscape pass produced, and it came from
+a thread about something else.
+
+## The Agentcoin question
+
+A collaboration thesis arrived with the summary: mining as the currency layer,
+Handsel as the labour layer, five integration points. Two of them are opposite
+in quality.
+
+**Staked tokens as collateral — sound.** Observable collateral needs a lookup,
+not a score, and this plugs into a mechanism that exists.
+
+**Mining history as a credit signal — unsound**, and not for the usual reason.
+The objection is not that the trust models differ and weights need tuning. The
+two measure **different quantities**: proof-of-work proves *compute spent*, and
+the score exists to price *execution risk*. An agent with a flawless mining
+record has demonstrated nothing about finishing a job. In `GRADER_WEIGHTS` it
+would be a ruler in a table of thermometers.
+
+One honest use, and it is the more valuable one:
+
+> Mining history as a **cost-to-forge signal**, not a competence signal.
+
+What proof-of-work genuinely establishes is that an identity cost money — which
+is Sybil resistance, the hole both the arXiv study and this project's own
+thesis point at. It even fixes cold start honestly: not *"this agent is good"*
+but *"this agent is expensive to throw away and remake"*.
+
+## What this pass changes
+
+Nothing about what to build next, which is the right outcome for a landscape
+document and the reason to distrust one that concludes otherwise. Three
+smaller things:
+
+1. **Speak ERC-8183** — the projection exists; use its vocabulary.
+2. **Stop saying "credit for AI agents"** — the field says it, it is true and
+   useless, and the narrow claim is the only defensible one.
+3. **The lender side is the real gap**, and a competitor shipping it first is
+   the concrete version of the thesis's own "not built" list.
+
+*Unverified, listed so the next pass knows where to start: AgentKarma, iAgentFi,
+ChainAware, Kustodia, RIP-302, AI Lance, AGIJobManager, OKX AI.*
+
+---
+
+# Third pass, 2026-08-06
+
+*Not prompted by an inbound summary this time — prompted by the operator asking
+why the last two passes missed the shipping half of the market. That is the
+honest frame for this section, and it goes first because the gap in method
+matters more than any single competitor added below.*
+
+## The method failure, named
+
+The July and August passes are deep on ERC-8004 and ERC-8183 — **standards** —
+and nearly blind on **shipping products**. The reason is mechanical, not lazy:
+
+- **You can only search for a name you already have.** A spec is a canonical
+  document you look up (`ERC-8195`); a product is a brand you have to already
+  know to type (`Claw Earn`). Concept searches surface specs; only *category*
+  searches ("agent marketplace USDC Base") surface names you did not have — and
+  those were not run until today.
+- **Spec depth felt like diligence and masked the blind spot.** Mining the 8183
+  thread was genuinely valuable, which is exactly why it was dangerous: depth on
+  one axis read as coverage.
+- **Every prior addition was reactive.** §6 arrived because a stranger forked the
+  repo; the second pass arrived from an outside summary. No pass ran an
+  unprompted "who else is doing this" sweep on its own.
+
+The evidence is in this very file: the second pass ended with a "next start" list
+that already contained **OKX AI** — a competitor flagged to check, never checked,
+until the operator pushed. Leaving a TODO to yourself is not research.
+
+Correction going forward: a category sweep runs *before* any positioning claim,
+not after someone asks.
+
+## The shipping half that was missing
+
+Single-source items are marked *reported*; the TaskMarket grading finding is
+*verified* because it was read from their spec directly.
+
+### daydreams / TaskMarket — the one already in a conversation with us
+
+`taskmarket.dev`, by **daydreams.systems**. `daydreamsai/taskmarket-contracts`
+(Beau Williams, ~51 commits, effectively one author — the solo-vs-org framing
+elsewhere overstated their headcount). Authors ERC-8195 and ERC-8194 as EIP
+drafts and ships the reference implementation: Diamond proxy, per-task
+`assignEvaluator`, evaluator stake, `appeal()` → `disputeResolver`.
+
+- **How we learned of it**: inbound (GitHub issue #3, `padsbanger`), not
+  discovery. It should have been found in July.
+- **The verified finding that matters** (read from `erc-8195.md` §4, not
+  reported): *"No automated evaluation — Benchmark-style tasks require **trusted
+  off-chain evaluators with no on-chain finality**,"* and "Trustless evaluation |
+  Optional." Their on-chain "independently verify" (`rev007`) checks that a
+  deliverable **hash was committed** (provenance), not that the work is correct
+  (quality). `evidenceHash` is a commitment, not a recomputation.
+- **So the wedge is real and narrow.** Handsel's *mechanical* verdict class (CI,
+  test suite, mutation, canary) is third-party recomputable; TMP's default
+  evaluator is a trusted opinion, and their standard leaves the trustless slot
+  *optional* behind a hook (`ITMPHook.checkEvaluate`, or `evaluatorFor` →
+  ERC-8004 Validation Registry). Handsel's *LLM-review* verdicts are the same
+  "stake, not truth" as theirs and are **not** differentiated — only the
+  mechanical lane is. This is the honest basis for the #57 outreach.
+
+### The Claw ecosystem — the closest thing to our repo-jobs / bounty lane
+
+**Claw Earn**, **ClawTasks**, **ClawMoney** — all in the **OpenClaw** ecosystem
+(*reported*, via aiagentstore/product listings). On-chain USDC bounty markets on
+Base: non-custodial escrow, worker **stake tiered by trust** (30% first task, 20%
+for #2–3, then 10%), minimum bounty ~9 USDC, primary flow human→agent but rails
+support A→A. That is Handsel's LaborMarket shape — escrow + worker bond +
+auto-settlement — shipped, on our chain.
+
+- **What is missing from them** (inferred from listings, not verified): an
+  *independent grading* layer. "Deliver, get paid per contract rules" is escrow
+  automation, not a verdict a third party recomputes. Same wedge as TMP — needs
+  verification before it becomes a pitch.
+- **Correction to the paragraph that stood here.** This section first claimed
+  "our capability directory is called ClawHub, rename it" — a factual error
+  introduced without checking. **ClawHub (`clawhub.ai`) is OpenClaw's own skill
+  registry, not ours.** `lib/clawhub.ts` is a read-client (its header: *"ClawHub
+  (OpenClaw's skill registry) read client"*) and `app/directory` surfaces
+  clawhub.ai live and links out to it. So there is nothing of ours to rename.
+  The real question the discovery raises is the opposite: **should Handsel keep a
+  page that advertises a competitor's registry and sends our traffic to it?**
+  That is a product decision (remove vs. keep as ecosystem aggregation), not a
+  naming one — recorded here so the wrong version does not get quoted again.
+
+### Distribution incumbents — the fight that is not winnable head-on
+
+- **OKX AI marketplace** (TechCrunch, 2026-06-30): a *licensed exchange* launched
+  a market where agents hire and pay each other in USDT/USDG and build **portable
+  on-chain reputation**; opened after a 50-provider closed beta. Reputation +
+  marketplace with an exchange's distribution.
+- **Circle Agent Stack** (*reported*): the USDC *issuer* shipped agent wallets, a
+  CLI, **an agent marketplace**, and nanopayments down to $0.000001.
+- **Coinbase AgentKit**: MPC wallets + gas sponsorship on Base for agent builders.
+
+None of these can be out-built on distribution by a solo project. The realistic
+posture is the one the thesis already implies: **be honorable-by-others, not
+dominant.** An open, recomputable proof that Circle/OKX/Claw could *consume* is a
+seat a solo builder can hold; "the reputation layer" is not.
+
+### The KYA product boom — the category I positioned into without checking
+
+Thirty minutes before writing this, the strategy discussion positioned Handsel as
+"the Know-Your-Agent / credit layer a16z says is the prerequisite." One category
+search shows that seat is crowded: **RNWY / knowyouragent.network** (claims 100k+
+registered agents), **Vouched** (established identity co., now an Agent Reputation
+Directory), **Billions**, **KnowThat.ai** (trust score + behavioral history)
+(*all reported*). a16z does name KYA as a prerequisite (*Sourcetrail, reported*) —
+but naming the need is not owning it, and identity/fraud KYA is a different
+product from work-quality grading.
+
+The honest residual: **not "KYA," not "agent reputation" (RNWY already has scale)
+— the one thin cell is reputation from independently-graded, third-party-
+recomputable *work outcomes*, wired to credit.** Identity-KYA players do fraud and
+behavioral signals; Claw/TMP do escrow without recomputable grading; Kojiru does
+credit but collateralized. The recomputable-grade-as-underwriting-input cell is
+where Handsel sits, and it is small enough to be either a moat or a graveyard.
+
+## The market-reality check the earlier passes lacked
+
+x402's ecosystem carries a ~$7B valuation and processes **~$28k/day of real
+volume, "much of it… gamed transactions rather than real commerce"** (*Coindesk,
+2026-03*). The category's own headline is *"demand is just not there yet."* This
+reframes our own cold start: **22-submissions-to-1 was not a defeat, it was the
+whole market's demand vacuum.** Do not fight for agent-labor demand that does not
+exist; the durable position is the credential/proof the arriving rails will
+require, honored by one venue first.
+
+## What this pass changes about the thesis
+
+Less than it feels like, and that honesty is the point.
+
+1. **The wedge survives, narrower.** Not the credential category (crowded), not
+   ideas (they converged — Kojiru, the 8183 authors, and this project independently
+   reached "execution risk," "stake not truth," the timing/validity split). The
+   surviving edge is (a) the *mechanical, recomputable* grade specifically, and
+   (b) the **discipline** — writing down our own holes (`failure-modes.md`,
+   `self-sybil.md`) is rarer than any insight here. Convergence validates the
+   *problem*; it does not hand over the *position*.
+2. **Distribution is lost head-on; interop is the only lane.** Publish
+   recomputable proofs others can consume; win one venue (daydreams/#57) before
+   widening. Outreach is sequential and gap-verified, never sprayed — a small
+   interconnected community (OpenClaw ↔ daydreams ↔ TaskMarket) makes a spammer
+   reputation fatal.
+3. **Drop "the KYA layer" framing.** Speak the narrow claim: *recomputable
+   grading as a credit input.* (An earlier draft here also said "the ClawHub name
+   has to go" — struck, because ClawHub is OpenClaw's registry, not ours; see the
+   correction under the Claw ecosystem above.)
+
+*Verified this pass by reading source: TMP's `erc-8195.md` §4 and `rev007`.
+Everything attributed to a product listing or single article is marked reported.
+Category searches (agent marketplace / KYA / x402 volume) are cited inline. The
+prior "unverified next-start" list still contains AgentKarma, iAgentFi,
+ChainAware, Kustodia, RIP-302, AI Lance, AGIJobManager — still unchecked, now
+honestly labelled as such rather than implied covered.*
+
+---
+
+# Fourth pass, 2026-08-06 — the similar-repo sweep, verified
+
+*Input: an operator-supplied list of ~25 "projects similar to Handsel" from an
+external AI search. Method, learned from §27: every entry is a claim until the
+repo is fetched. Eight were verifiable (owner/name given) and were verified by
+reading their GitHub pages this pass; the rest were supplied without links and
+are listed as unverified at the bottom rather than silently absorbed.*
+
+## Verified — what actually exists
+
+| Project | Vital signs | What it is | Consequence for us |
+|---|---|---|---|
+| **MeshLedger/MeshLedger** | 3★, Base **mainnet**, escrow contract live (`0x9Fc4…3dA1`), meshledger.io, 15 MCP tools, 347 tests | Escrow + reputation + dispute resolution + MCP marketplace — the most Handsel-shaped repo found to date | **"Escrow market on Base with MCP" is now a commodity shape, not a differentiator.** Same 3-star traction as everyone; reputation algorithm undocumented. The board is a category; the wedge cannot be the board |
+| **arian-gogani/nobulex** | 38★, 445 commits, SDKs on PyPI/npm — and **explicitly archived/pivoted** to "tool reliability" (nobulex-registry) | Ed25519 hash-chained receipts of agent actions, offline third-party verification, trust tiers, priced verification API | Closest thing to our proof-ledger claim — with the load-bearing difference: **their receipts are self-signed by the agent.** That proves log integrity, not outcome. Ours are signed by an independent grader with escrow at stake. Also a demand signal: the best-executed trust-scoring repo in the sweep *pivoted away* from trust scoring |
+| **strangeloopcanon/agent-economy** | 7★, Python, active; SWE-bench-calibrated experiments | Research prototype of the exact build-service mechanism: goal→DAG, worker bidding, sandboxed execution, **pay-only-on-PASS**, oracle classes (tests / LLM consensus / human) | **Simulation, no real money** — an intellectual ally, not a competitor. Their Phase-II market-vs-solo data is prior art `docs/build-service.md` should read; their "Oracle" slot is another socket the evaluator lane fits |
+| **darks0l/synthesis-agent** | 1★, hackathon (Mar 2026), but real on-chain artifacts on Base mainnet | Autonomous arb agent that self-custodies an ERC-8004 identity and outsources work through its own ERC-8183 jobs contract **and Virtuals ACP v2** | Confirms the ERC-8004/8183 lane has third-party adopters beyond daydreams itself, and that ACP (§2, already ranked closest functional competitor) is where hackathon agents actually cross-post |
+| **dolepee/creditgate** | 1★, 27 commits, 0G mainnet, APAC hackathon submission | Reads signed agent history → "**replayable credit score**" → bounded spend cap → "canonical proof packet" on 0G Storage | Our vocabulary, independently invented, at hackathon depth. Validates "recomputable grading as a credit input" as a lane others can see; no execution threat |
+| **capGoblin/Credex** | 0★, 5 commits, Arc **testnet** | Agent lending with a "silent" risk engine, +10% limit on repayment | Hackathon prototype; the credit-scoring method is undisclosed, i.e. not a check |
+| **langoai/lango** | 13★, 1,643 commits, Base Sepolia | Go multi-agent runtime with optional escrow, ERC-4337/7579, x402 | Infrastructure-adjacent, experimental, testnet. A potential *client* of proofs, not a competitor |
+| **agent-matrix/matrix-treasury** | 0★, no visible commits, "admin/admin123" in docs | "Enterprise economic OS" README | Aspirational documentation. Vaporware tier — recorded so the next sweep doesn't re-inflate it |
+
+## Not verified (supplied without links — names only)
+
+Claw Town, Agent Guild, AgentCredit (OpenClaw skill), Primordia/Kaledge, ASA,
+Aegis (Sui), AutoClaw, elisym, Agent Starter, Agent Wallet, Post Quantum Agent,
+AgentBazaar (Arc), polyagent, autonomous-ai-data-marketplace, Open MCP
+Marketplace. Any of these may be real; none was fetched. They are names in an
+AI-generated list until someone runs the command.
+
+## What this pass changes
+
+1. **Nothing about the wedge — and that is now better evidenced.** The
+   commodity shape (escrow board + reputation + MCP) has a live Base-mainnet
+   instance with our exact traction problem. The two properties still absent
+   everywhere verified: verdicts signed by an **independent** grader with money
+   at stake (nobulex self-signs; MeshLedger doesn't document; creditgate
+   replays *history*, not verdicts), and the **evaluator-for-other-markets**
+   interop lane.
+2. **A demand datapoint from the best-executed neighbour.** nobulex — more
+   stars, more commits, published SDKs, OWASP adoption — pivoted *away* from
+   agent trust scoring toward tool reliability. Trust scores alone did not find
+   buyers there either. Consistent with this session's turn: attach to where
+   agents already work; sell outcomes, not membership.
+3. **agent-economy goes on the build-service reading list** — pre-existing
+   experimental evidence for pay-on-pass market mechanics, including the
+   failure-penalty/reputation-weighted bidding math we have not designed yet.
+
+---
+
+# Fifth pass, 2026-09-04 — checking the "Agency Delivery OS" framing against two new categories
+
+*Prompted by an operator-supplied competitive read arguing Handsel should
+position as an "AI Agency Delivery OS" rather than a marketplace. That framing
+does not change anything decided in `docs/positioning.md` §8 (2026-09-03) —
+operations room, priced monthly, Repo Care first — it sharpens the same
+decision, so this pass exists to check its two new claims rather than to
+relitigate the decision. Method as always: every name is fetched before it is
+scored. Two categories were actually new to this document; two claimed
+protocols turned out not to be products at all.*
+
+## A. "Verify-then-pay" protocols — RAILS and TessPay are papers, not products
+
+The operator's table scored "증거를 확인한 뒤 지급" (pay after evidence) 5/10
+novelty against RAILS and TessPay specifically. Checked:
+
+- **RAILS** — "RAILS: Verification-Native Clearing For Agentic Commerce"
+  ([arXiv:2606.08790](https://arxiv.org/abs/2606.08790), June 2026). A
+  research paper proposing a reliability score + clearing function that
+  consumes tool traces (MCP) and subdelegation events (A2A) as evidence. No
+  deployment, no users, no chain address — a design, not a competitor.
+- **TessPay** — "TessPay: Verify-then-Pay Infrastructure for Trusted Agentic
+  Commerce" ([arXiv:2602.00213](https://arxiv.org/abs/2602.00213)), attributed
+  to Tesseris, described elsewhere as a proposed L1 "ecosystem for trusted
+  agentic commerce". Also a paper; no evidence of a live chain, a shipped
+  contract, or a settled transaction was found in this pass.
+
+**Correction to the operator's scoring: this is not "someone else already
+proposed pay-after-evidence at novelty 5/10" — it is "the idea has reached
+academic proposal stage and nobody has shipped it."** Handsel's
+`LaborMarketV2` on Base mainnet, independently graded, pay-only-on-pass, live
+since 2026-07-30, is *ahead* of both papers on the one axis that matters:
+it moved real USDC on a real verdict. The honest risk is the opposite of what
+the table implies — these papers are evidence the idea is about to get
+well-funded competition (see Nava Labs below), not evidence it is taken.
+
+Adjacent and worth tracking, found in the same sweep and NOT in the
+operator's list: **Nava Labs** ($8.3M seed, Polychain/EigenLayer-backed,
+"escrow-before-execution" AI agent verification layer — reported via
+BlockEden, not independently verified against a live product this pass) and
+**Agentry Escrow** (a marketed "independent payment rails for AI agents"
+product; not fetched this pass). Both are unverified beyond the article that
+named them — next pass should fetch them directly rather than carry the
+citation forward as fact.
+
+## B. "AI workforce" SaaS — the real adjacent category, and it is not a payments company
+
+The operator's "Agency Delivery OS" pitch competes for the same buyer as a
+different, very real, well-funded category this document had not covered:
+no-code platforms selling "an AI workforce" to a business's ops/GTM team.
+Verified this pass:
+
+| Product | Vital signs (2026) | What it actually sells | Difference from Handsel |
+|---|---|---|---|
+| **Relevance AI** | Founded 2020 (Sydney); Pro $19/mo, Team $234–349/mo, meters "Actions" + "Vendor Credits" since Sep 2025 | No-code AI agent builder, "AI workforce," 2,000+ integrations, strongest in sales/marketing/support GTM automation | Builds and runs agents *inside* the buyer's own tools (Slack, Salesforce, Sheets). No escrow, no independent grader, no per-task verdict — the buyer trusts the agent's output the same way they trust a spreadsheet macro |
+| **Lindy** | Repositioned Jan–Mar 2026 as a consumer AI executive assistant; Plus $49.99/Pro $99.99/Max $199.99/mo, no free tier | Personal/executive-assistant-shaped automation (inbox, calls, scheduling) | Consumer/individual framing, not a delivery pipeline for a repo or a client's backlog; no verification layer at all |
+| **CrewAI** | 47.8k+ GitHub stars, 27M+ downloads, 150+ enterprise customers, open-source framework + paid "AMP" enterprise platform ($25/mo Professional, $50–150k/yr Enterprise) | Role-based multi-agent orchestration — a framework a developer builds *with*, not a product an agency buys as a finished service | This is infrastructure a competitor could use to build something Handsel-shaped, not a finished competitor itself. Same relationship as LangGraph: a potential substitute for our own orchestration code, not for the product |
+| **Zapier Agents** | GA in 2026, 8,000+ pre-built integrations (incl. SAP/NetSuite/Workday), "AI Guardrails," bring-your-own-model | Goal-oriented agents wired into Zapier's existing automation graph | Same shape as Relevance AI — integration breadth is the moat, not verification. Neither ships escrow, independent grading, or a signed proof of what shipped |
+
+**What none of the four do, which is the actual gap the operator's table was
+reaching for:** none of them price, escrow, or independently verify a
+*specific deliverable* before paying for it — because none of them separate
+"the agent ran" from "the agent's output was checked by something other than
+the agent." They sell agent *capacity*; Handsel's Repo Care sells a **graded
+PR** — money moves only after independent verification. That is the same
+distinction §6b of this document already drew against GitHub Copilot's coding
+agent (a worker without a market); the addition this pass makes is that the
+"AI workforce" SaaS category is a worker **with** a subscription business
+model and no market either. Confirms rather than changes the existing
+threat ranking.
+
+**Cursor Cloud Agent** (formerly Background Agents) was also checked, since
+the operator's table cited it alongside Copilot: confirmed live, opens
+merge-ready PRs from a cloud VM, and — per the Cursor community forum,
+2026 — background agents spawned via the API still cannot post PR comments,
+reviews, or issue operations without extra plumbing. Functionally the same
+slot as Copilot's coding agent already covered in §6b: a well-resourced
+worker, still no market, still no independent grader, still nothing that
+transfers to the next job. Not re-scored as a separate threat.
+
+## What this pass changes
+
+1. **Nothing about the ranked threat list in "Honest threat ranking" above.**
+   Virtuals ACP, ERC-8004, a well-funded fintech, GitHub itself, and
+   UbiquityOS/Algora remain the five in that order — the AI-workforce SaaS
+   category and the verify-then-pay papers both land in a **different
+   fight**: they compete for how the *product is described and sold*
+   (§7–8 of `docs/positioning.md`), not for the *market mechanism* this
+   document tracks.
+2. **One correction the operator's own table should carry forward**: do not
+   describe RAILS/TessPay as prior art already "5/10 taken" — they are
+   unshipped research, and the honest read is that Handsel is ahead of
+   published academic proposals on the exact axis (real settled money) that
+   would make either of them a threat once someone builds one.
+3. **The "Agency Delivery OS" framing is now checked against its real
+   competitors** (Relevance AI, Lindy, CrewAI, Zapier Agents) rather than
+   only against agent-market and agent-payment projects. All four sell agent
+   capacity with no independent verification of a specific deliverable —
+   which is exactly the wedge §6b and the "Honest threat ranking" already
+   named, now confirmed from a different direction.
+
+---
+
+# Sixth pass, 2026-09-16 — Aomi Labs: the execution-harness category, and what was taken from it
+
+*Prompted by an operator pointing at [github.com/aomi-labs](https://github.com/aomi-labs)
+and asking what, if anything, applies. Method as always: every claim below was
+fetched (org page, READMEs of `aomi`, `skills`, `docs`, `aomi-sdk`,
+`liqsteward`, `eliza-plugin-aomi`, and the raw `aomi-transact` SKILL.md and
+SECURITY.md) rather than carried from memory. Nothing here was run.*
+
+## What Aomi is
+
+Aomi Labs describes itself as "the best blockchain harness for agentic AI —
+on-chain execution with runtime, skills, and component library." Concretely,
+across ~32 public repos, the product is:
+
+- **A chat → transaction runtime** (`aomi`, TypeScript monorepo): a headless
+  React runtime and widget, a TypeScript client and `aomi` CLI, and a backend
+  that turns a prompt ("swap 1 ETH for USDC", "bet $100 on Polymarket") into a
+  *queued wallet request* the user signs. Account-abstraction-first (EIP-7702
+  on Ethereum, ERC-4337 with Alchemy/Pimlico on L2s), with **batch fork
+  simulation before signing** (`aomi tx simulate tx-1 tx-2`) and "drain-vector"
+  annotations that block, for example, a recipient that is not `msg.sender`.
+- **A plugin runtime** (`aomi-sdk`, Rust): third-party APIs wrapped as
+  "intent-shaped tools" (`search_*`, `get_*`, `build_*`) compiled to native
+  `.so`/`.dylib` plugins that the backend **hot-loads via `dlopen`**, polling
+  a release tarball whose `manifest.json` carries per-plugin SHA-256s.
+  Official apps: DeFi, Polymarket, Kalshi, Para, social.
+- **Agent Skills** (`skills`): `aomi-transact` (drive the CLI) and
+  `aomi-build` (scaffold a plugin from an OpenAPI spec), installable with
+  `npx skills add aomi-labs/skills` into Claude Code, Cursor, Codex, Gemini.
+- **Two governance-shaped deployments**: `liqsteward`, which plans vault
+  mitigations and emits *unsigned* Safe transaction JSON ("neither LiqSteward
+  nor Aomi is the curator, signer, custodian, or broadcaster"), and
+  `eliza-plugin-aomi`, whose "wallet-backed confirmation" stops every write
+  at an exact preview, requires a separate confirmation turn **from the same
+  user who initiated**, and ignores any LLM-supplied confirmation flag.
+
+Vital signs are small: 13 stars on the main repo, 7 on `skills`, active daily
+commits through 2026-09-16, MIT throughout.
+
+## Where it sits relative to Handsel
+
+**Not a competitor for the market mechanism.** Aomi has no escrow, no
+independent grader, no verdict, no credit score, no market — it is the layer
+*below* an agent's wallet: how an agent's intent becomes a signed transaction
+safely. In this document's taxonomy it is closest to §3 (payment rails,
+complementary) and to the "worker without a market" slot of §6b: a very good
+way for an agent to *act* on-chain, with nothing that says whether the action
+was the right one or pays anyone for it.
+
+**Adjacent in one specific way that matters to us.** Handsel already holds an
+ERC-4337 Kernel account per agent and sends UserOps on its behalf
+(`lib/onchain/account.ts`). Aomi is what a *self-custodial* agent would use to
+do the same thing from its own wallet. If Handsel ever lets an agent bring its
+own account to the market instead of using the platform-held one, Aomi's CLI
+is one of the obvious things that agent would be holding. That is a future
+integration surface, not a present overlap.
+
+## What was taken
+
+**The skill security manifest — adopted.** `aomi-labs/skills` is the first
+skill repo this document has seen that ships, per skill, an OWASP Agentic
+Skills Top 10 `permissions:` block (`files` / `network` / `shell` / `tools`,
+explicit paths, `deny_write` on `SOUL.md`/`MEMORY.md`/`AGENTS.md`), a
+`risk_tier` (L0–L3), and a `SECURITY.md` walking AST01–AST10 with the control
+for each and the ones still open, plus captured third-party scanner reports.
+Handsel ships four authored skills, one of them a public package strangers
+install to earn and spend real USDC, and none of them said what it was
+allowed to touch. All four now do; `tests/skill-manifests.test.ts` keeps the
+manifest and the skill from drifting apart (an allow-listed host the skill
+never names, a literal host in `scripts/` the manifest omits, a tier the two
+halves disagree on). Details in `docs/security-audit.md`, "Skills as an
+attack surface". We did not adopt the scanner reports — running them is a
+real step, not a paragraph, and is listed as open.
+
+## What was considered and not taken, and why
+
+1. **Fork simulation before every send.** Aomi simulates a batch on a forked
+   chain before signing and refuses on any failure. Handsel's UserOps already
+   pass through the bundler's `eth_estimateUserOperationGas`, which in practice rejects a
+   reverting `callData` before anything is broadcast, and `lib/onchain/
+   custom-errors.ts` decodes the contract's own error out of that rejection.
+   More to the point, Aomi's drain-vector guards protect against **free-form
+   calldata composed from third-party data** (a swap route from an
+   aggregator). Handsel composes no such calldata: every write is a fixed
+   `LaborMarketV2` method whose recipient is the contract's own rule
+   (escrow to the market, release to the worker, bond back to the worker).
+   There is no recipient field for a hostile brief to steer. A pre-send
+   `eth_call` would add a second simulation of the same thing, not a new
+   guard.
+2. **Confirmation bound to the initiator, LLM flags ignored.** Handsel's
+   money step is already a *separate tool call* (`confirm_delegation` after
+   `plan_delegation`; `release_job`; `decide_session_approval`), and
+   `confirmDelegationJobs` checks the delegation belongs to the calling
+   account before it posts anything. No tool takes a "the user said yes"
+   boolean. What Handsel cannot do — and neither can Aomi's MCP-shaped
+   surfaces — is see whether the human between the LLM and the tool actually
+   approved; the Eliza plugin can, because it owns the chat turn. Same
+   posture, different substrate; nothing to port.
+3. **Hot-loaded native plugins.** This is the one thing Aomi does that
+   Handsel has explicitly decided not to: hosting and executing other
+   people's code. `docs/coordination-layer.md` and `docs/external-grading.md`
+   both refuse it for the same reason — it inverts "we don't run your code",
+   and a `dlopen`'d `.so` from a 5-minute poll is the strongest form of that
+   inversion. Aomi's SHA-256-per-plugin manifest is the right control *if*
+   you have chosen to run the code; we have not.
+4. **`npx skills add`-style distribution.** Aomi installs from a GitHub repo
+   via a community CLI. Handsel already has three install paths for the
+   public package (marketplace layout, `install-skill.sh`, direct download),
+   and the `.claude/skills/*/SKILL.md` layout is what that CLI discovers, so
+   `npx skills add Kairose-master/handsel` should already work. Not verified
+   this pass — the environment refuses arbitrary npm execution — so it is
+   not claimed.
+
+## What this pass changes
+
+1. **Nothing in the threat ranking.** Aomi is infrastructure an agent brings
+   to a market, not a market.
+2. **One control adopted, repo-wide**, on a surface (skills) this document's
+   companion `security-audit.md` had never listed. That is the useful kind of
+   landscape finding: not "they are ahead" but "they did the obvious thing
+   and we had not."
+3. **A named future integration surface**: an agent bringing its own
+   Aomi-signed account to Handsel instead of the platform-held Kernel. Filed,
+   not planned.

@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "handsel": {
+      "url": "https://handsel-nu.vercel.app/api/mcp"
+    }
+  }
+}

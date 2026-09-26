@@ -2,7 +2,9 @@
 
 EAG Ethereum Hackathon @ Sydney（2026-09-26），目標 track：**HSK Chain**（AI Agents / Payments）。
 
-> 狀態：骨架。合約尚未部署，端到端流程尚未跑通。實作在隊友的 `ph1gros/handsel-hsk-lite`（私有），本 repo 目前放規格、審查結論與待決事項。
+> 狀態：已加入 `handsel-hsk-lite/` 參考實作，合約尚未部署，端到端流程尚未跑通。先看 [項目與分工（簡版）](docs/PROJECT-BRIEF.md)，啟動與部署看 [README-HSK](handsel-hsk-lite/README-HSK.md)。執行命令前先 `cd handsel-hsk-lite`。
+
+本次實作核驗同一 PR head SHA 上、指定 GitHub App 的全部**已配置必需檢查名**；未配置的檢查不在此判定範圍內。配置缺失或 API 無法確認時不放款。上游程式碼與 LICENSE 保留於子目錄，未替換本倉庫原有規格和討論記錄。
 
 ## 一句話
 

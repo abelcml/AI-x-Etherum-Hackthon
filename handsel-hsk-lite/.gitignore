@@ -1,0 +1,35 @@
+# v0 sandbox internal files
+__v0_runtime_loader.js
+__v0_devtools.tsx
+__v0_jsx-dev-runtime.ts
+.snowflake/
+.v0-trash/
+.vercel/
+
+# Environment variables
+.env
+.env*.local
+
+# Common ignores
+node_modules
+.next/
+.DS_Store
+# Build artifacts
+tsconfig.tsbuildinfo
+
+# Test coverage output
+coverage/
+.eslintcache
+
+# Python
+__pycache__/
+*.pyc
+agent-runtime/.venv/
+
+# Rust / Tauri desktop app
+desktop/src-tauri/target/
+desktop/src-tauri/gen/
+desktop-office/src-tauri/target/
+desktop-office/src-tauri/gen/
+solana/target/
+solana/.anchor/
