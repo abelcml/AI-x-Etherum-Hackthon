@@ -1,0 +1,1054 @@
+import { beforeEach, describe, expect, it } from 'vitest'
+import { ACCOUNTS, Chain, artifacts, marketConfig } from './helpers/evm'
+
+/**
+ * LaborMarketV2 exercised in a real EVM.
+ *
+ * The claims made in that contract's comments — permissionless exits, an
+ * irrevocable assignment, a late delivery that cannot double-settle — are
+ * claims about executed bytecode, and a comment cannot establish any of them.
+ * This is where they are either true or not.
+ */
+
+const BOUNTY = 1_000_000n // 1 USDC at 6 decimals
+const WINDOW = 3600 // 1 hour delivery window
+const REVIEW_WINDOW = 7 * 24 * 3600
+/** Deployments under test charge a real fee, so every escrow path is exercised
+ *  with one rather than with the zero that would hide an accounting mistake. */
+const FEE_BPS = 200n
+const feeOn = (bounty: bigint) => (bounty * FEE_BPS) / 10_000n
+
+const SPEC = '0x' + '11'.repeat(32)
+const RESULT = '0x' + '22'.repeat(32)
+
+const Status = {
+  Open: 0,
+  Accepted: 1,
+  Submitted: 2,
+  Completed: 3,
+  Cancelled: 4,
+  Disputed: 5,
+  Refunded: 6,
+  Expired: 7,
+} as const
+
+/** What a silent requester forfeits to the worker side: SILENCE_FORFEIT_BPS. */
+const FORFEIT = BOUNTY / 10n
+
+type Ctx = {
+  chain: Chain
+  usdc: `0x${string}`
+  registry: `0x${string}`
+  market: `0x${string}`
+}
+
+async function setup(): Promise<Ctx> {
+  const chain = await Chain.create()
+  const usdc = await chain.deploy('TestUSDC')
+  const registry = await chain.deploy('TestRegistry')
+  const market = await chain.deploy('LaborMarketV2', [usdc, registry, ACCOUNTS.arbiter, marketConfig()])
+  await chain.send('requester', usdc, 'TestUSDC', 'mint', [ACCOUNTS.requester, BOUNTY * 100n])
+  await chain.send('requester', usdc, 'TestUSDC', 'approve', [market, BOUNTY * 100n])
+  return { chain, usdc, registry, market }
+}
+
+async function post(ctx: Ctx, window = WINDOW): Promise<bigint> {
+  await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'postJob', [BOUNTY, 0n, SPEC, window])
+  return ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'jobCount')
+}
+
+const job = (ctx: Ctx, id: bigint) =>
+  ctx.chain.call<unknown[]>('requester', ctx.market, 'LaborMarketV2', 'jobs', [id])
+
+/**
+ * Positions in the generated `jobs` getter, DERIVED from the compiled ABI.
+ *
+ * They used to be literals with a comment warning that adding a struct field
+ * shifts every index after it. Adding `openDeadline` then did exactly that, and
+ * the comment did not stop it — `payee` silently became `deliveryWindow` and a
+ * test compared an address to `3600`. It was caught only because the wrong
+ * value was obviously wrong; a shift between two addresses would have passed.
+ *
+ * A warning is not a mechanism. Reading the names out of the artifact is.
+ */
+const JOB_FIELDS = (
+  (artifacts.LaborMarketV2.abi as ReadonlyArray<{ type: string; name?: string; outputs?: { name: string }[] }>)
+    .find((e) => e.type === 'function' && e.name === 'jobs')?.outputs ?? []
+).map((o) => o.name)
+
+const fieldIndex = (name: string) => {
+  const i = JOB_FIELDS.indexOf(name)
+  if (i === -1) throw new Error(`jobs() has no field "${name}" — the struct changed`)
+  return i
+}
+const FIELD = { status: fieldIndex('status'), payee: fieldIndex('payee') } as const
+
+const status = async (ctx: Ctx, id: bigint) => Number((await job(ctx, id))[FIELD.status])
+const payee = async (ctx: Ctx, id: bigint) => String((await job(ctx, id))[FIELD.payee]).toLowerCase()
+const wallet = (ctx: Ctx, who: `0x${string}`) =>
+  ctx.chain.call<bigint>('requester', ctx.usdc, 'TestUSDC', 'balanceOf', [who])
+
+/**
+ * What a party has ENDED UP WITH: tokens in its wallet plus tokens the contract
+ * has credited it and not yet handed over.
+ *
+ * Settlement credits rather than transfers (see `withdraw` in the contract, and
+ * tests/labor-market-v2-hostile.evm.test.ts for the blocklisted-recipient
+ * bricks that forced it). Every assertion below that used a raw token balance
+ * meant "what did this party get", and that quantity is now the sum of the two.
+ * Asserting only the wallet would test the withdrawal step, which is not what
+ * any of these cases are about.
+ */
+const balance = async (ctx: Ctx, who: `0x${string}`) =>
+  (await wallet(ctx, who)) +
+  (await ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'withdrawable', [who]))
+
+/**
+ * What is still locked in ESCROW — money attached to jobs that have not
+ * settled.
+ *
+ * This replaces the old `balance(ctx, ctx.market) === 0` assertion, and the
+ * distinction is the whole point of the pull-payment change. The market's token
+ * balance no longer empties at settlement: it holds credited-but-unclaimed
+ * money until each party withdraws. "The job released its escrow" and "the
+ * tokens have left the building" used to be the same statement and are not any
+ * more, and every assertion below means the first one.
+ */
+const stillEscrowed = (ctx: Ctx) =>
+  ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'totalEscrowed')
+
+let ctx: Ctx
+beforeEach(async () => {
+  ctx = await setup()
+})
+
+describe('the happy path still works', () => {
+  it('escrows on post, releases to the worker on approve', async () => {
+    const before = await balance(ctx, ACCOUNTS.requester)
+    const id = await post(ctx)
+    // The contract holds the bounty exactly; the fee went straight out to the
+    // house. The requester paid bounty + fee, and the WORKER is still owed the
+    // whole advertised bounty — a board price that is not the paid price is a
+    // price nobody can plan against.
+    expect(await stillEscrowed(ctx)).toBe(BOUNTY)
+    expect(await balance(ctx, ACCOUNTS.house)).toBe(feeOn(BOUNTY))
+    expect(await balance(ctx, ACCOUNTS.requester)).toBe(before - BOUNTY - feeOn(BOUNTY))
+
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'approveJob', [id])
+
+    expect(await status(ctx, id)).toBe(Status.Completed)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(BOUNTY)
+    expect(await stillEscrowed(ctx)).toBe(0n)
+  })
+
+  it('refuses a worker whose score is below the job threshold', async () => {
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'postJob', [BOUNTY, 700n, SPEC, WINDOW])
+    const id = await ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'jobCount')
+    expect(await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])).toBeTruthy()
+
+    await ctx.chain.send('requester', ctx.registry, 'TestRegistry', 'setScore', [ACCOUNTS.worker, 700n])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    expect(await status(ctx, id)).toBe(Status.Accepted)
+  })
+
+  it('will not let the requester work its own job', async () => {
+    const id = await post(ctx)
+    expect(await ctx.chain.revertReason('requester', ctx.market, 'LaborMarketV2', 'acceptJob', [id])).toBeTruthy()
+  })
+})
+
+describe('reclaimJob — the exit from Accepted that v1 did not have', () => {
+  it('refuses before the deadline', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW - 1)
+    expect(await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])).toContain('TooEarly')
+    expect(await status(ctx, id)).toBe(Status.Accepted)
+  })
+
+  it('refunds the requester once the deadline passes', async () => {
+    const before = await balance(ctx, ACCOUNTS.requester)
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW)
+
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+    // The BOUNTY comes back; the fee does not. It is a toll on occupying the
+    // board, and a refundable toll is not a toll — a wash-trading ring would
+    // post and reclaim all day for free.
+    expect(await balance(ctx, ACCOUNTS.requester)).toBe(before - feeOn(BOUNTY))
+    expect(await stillEscrowed(ctx)).toBe(0n)
+  })
+
+  it('IS permissionless — a stranger with no relationship to the job can call it', async () => {
+    // This is the property that stops the operator being a custodian. If it
+    // ever regresses to "requester only", a user who cannot reach the operator
+    // has no way to recover their own escrow.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+  })
+
+  it('cannot be replayed for a second refund', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    expect(await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])).toBeTruthy()
+    expect(await stillEscrowed(ctx)).toBe(0n)
+  })
+
+  it('does not apply to an Open job — cancelJob is that path', async () => {
+    const id = await post(ctx)
+    ctx.chain.advance(WINDOW * 10)
+    expect(await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])).toBeTruthy()
+  })
+
+  it('reclaimable() agrees with what reclaimJob actually does', async () => {
+    // The off-chain warner reads this instead of keeping its own clock; two
+    // clocks disagreeing is how the original incident happened.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    expect(await ctx.chain.call<boolean>('stranger', ctx.market, 'LaborMarketV2', 'reclaimable', [id])).toBe(false)
+    ctx.chain.advance(WINDOW)
+    expect(await ctx.chain.call<boolean>('stranger', ctx.market, 'LaborMarketV2', 'reclaimable', [id])).toBe(true)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    expect(await ctx.chain.call<boolean>('stranger', ctx.market, 'LaborMarketV2', 'reclaimable', [id])).toBe(false)
+  })
+})
+
+describe('the late delivery race — the question put to Olas in mech#470', () => {
+  it('refuses a submission once the deadline has passed, so the race has ONE answer', async () => {
+    // This used to assert the opposite — that a late submission landing first
+    // won, and block order was the tie-break. That answer let a worker who blew
+    // the deadline by a month still submit, restart a seven-day review clock,
+    // and put the requester on the hook to actively dispute or forfeit a tenth
+    // to someone who had already failed. The requester would have been
+    // defending against a deadline that had already passed in its favour.
+    //
+    // Now the deadline ends the right to deliver, so before it only submitWork
+    // can win and after it only reclaimJob can. One answer, not two.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW)
+
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT]),
+    ).toContain('TooLate')
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+  })
+
+  it('still lets a submission one second BEFORE the deadline win', async () => {
+    // The guard must end the claim, not shorten it. A worker that delivers
+    // inside its window keeps the ordinary race, and reclaim then loses.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW - 1)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    expect(await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])).toBeTruthy()
+    expect(await status(ctx, id)).toBe(Status.Submitted)
+  })
+
+  it('a reclaim that lands first makes the submission revert', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW)
+
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    expect(await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])).toBeTruthy()
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+  })
+
+  it('never settles twice, whichever order they arrive in', async () => {
+    // The failure this prevents is two deliveries paid for one request, which
+    // is the shape the Olas take-over question was about.
+    const before = await balance(ctx, ACCOUNTS.requester)
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    ctx.chain.advance(WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+    await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+
+    expect(await stillEscrowed(ctx)).toBe(0n)
+    expect(await balance(ctx, ACCOUNTS.requester)).toBe(before - feeOn(BOUNTY))
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(0n)
+  })
+})
+
+describe('expireReview — the mirror stall, when the requester goes silent', () => {
+  it('refuses before the review window closes', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    ctx.chain.advance(REVIEW_WINDOW - 1)
+    expect(await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])).toContain('TooEarly')
+  })
+
+  it('refunds MOST of it, and charges the requester a tenth for the silence', async () => {
+    // Free is not neutral, it is dominant. The requester already holds the
+    // deliverable; approving costs gas, disputing costs gas, and saying nothing
+    // used to pay. Paying the full bounty out instead would make "submit
+    // anything and wait" a way to extract escrow with no grader involved, so
+    // neither extreme is right.
+    const before = await balance(ctx, ACCOUNTS.requester)
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    ctx.chain.advance(REVIEW_WINDOW)
+
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])
+    expect(await status(ctx, id)).toBe(Status.Expired)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(FORFEIT)
+    expect(await balance(ctx, ACCOUNTS.requester)).toBe(before - FORFEIT - feeOn(BOUNTY))
+    expect(await stillEscrowed(ctx)).toBe(0n) // the escrow is fully distributed
+  })
+
+  it('is its own state, not Refunded — the balances do not match a refund', async () => {
+    // A reconciler reading `Refunded` would expect the whole bounty back and
+    // find 90%, then have to decide whether that was a bug or a theft. And
+    // nobody graded this work, so the credit engine must not score it as a
+    // worker failure.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    ctx.chain.advance(REVIEW_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])
+
+    expect(await status(ctx, id)).not.toBe(Status.Refunded)
+    expect(await status(ctx, id)).not.toBe(Status.Completed)
+  })
+
+  it('prices the silence BEFORE it is levied, while there is time to act', async () => {
+    // A charge a party cannot see coming is a penalty. This is not one.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    const split = await ctx.chain.call<unknown[]>('requester', ctx.market, 'LaborMarketV2', 'expirySplit', [id])
+    expect(split[0]).toBe(BOUNTY - FORFEIT)
+    expect(split[2]).toBe(FORFEIT)
+  })
+
+  it('pays the forfeit to the LENDER first when the worker pledged the job', async () => {
+    // The advance ($400k of a $1M bounty) exceeds the forfeit, so the lender
+    // takes all of it. Paying the borrower ahead of its own secured lender out
+    // of the same collateral is what a lien exists to prevent — and it would
+    // let a THIRD party's inaction strip the lender's security.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [id, ACCOUNTS.lender, BOUNTY / 2n])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    ctx.chain.advance(REVIEW_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(FORFEIT)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(0n)
+  })
+
+  it('leaves the worker the remainder once a small lien is satisfied', async () => {
+    const id = await post(ctx)
+    const small = FORFEIT / 4n
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [id, ACCOUNTS.lender, small])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    ctx.chain.advance(REVIEW_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(small)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(FORFEIT - small)
+  })
+
+  it('rounds the forfeit DOWN rather than reverting on a cent-scale bounty', async () => {
+    // A settlement that cannot execute is worse than a forfeit that does not
+    // apply, and the mainnet plan turns on very small bounties.
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'postJob', [1n, 0n, SPEC, WINDOW])
+    const id = await ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'jobCount')
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    ctx.chain.advance(REVIEW_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])
+
+    expect(await status(ctx, id)).toBe(Status.Expired)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(0n)
+    expect(await stillEscrowed(ctx)).toBe(0n)
+  })
+
+  it('does not reach a disputed job — that belongs to the arbiter', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [id])
+    ctx.chain.advance(REVIEW_WINDOW * 10)
+    expect(await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [id])).toBeTruthy()
+    expect(await status(ctx, id)).toBe(Status.Disputed)
+  })
+})
+
+describe('assignPayee — the lien, and the size of it', () => {
+  /** A lender advancing 40% of the bounty — the shape the LTV actually takes. */
+  const ADVANCE = (BOUNTY * 40n) / 100n
+  const assign = (id: bigint, amount = ADVANCE, to: string = ACCOUNTS.lender) =>
+    ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [id, to, amount])
+
+  it('pays the lender its advance and the WORKER the rest, in one release', async () => {
+    // The property that makes this security rather than a transfer of risk.
+    // Sole-payee assignment would send the lender the full bounty and leave it
+    // owing the worker the remainder — off-chain, unsecured, in the opposite
+    // direction. The worker would have swapped funding risk for counterparty
+    // risk on its own lender.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await assign(id)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'approveJob', [id])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(ADVANCE)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(BOUNTY - ADVANCE)
+  })
+
+  it('never pays out more than the job escrowed', async () => {
+    // The invariant that keeps one job's release from reaching another job's
+    // money. Two jobs live, one settles: the contract must still hold the other.
+    const first = await post(ctx)
+    const second = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [first])
+    await assign(first, BOUNTY)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [first, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'approveJob', [first])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(BOUNTY)
+    expect(await stillEscrowed(ctx)).toBe(BOUNTY) // the second job, untouched
+    expect(await status(ctx, second)).toBe(Status.Open)
+  })
+
+  it('tells the lender what it is owed, so the lender never recomputes the split', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await assign(id)
+    const split = await ctx.chain.call<unknown[]>('lender', ctx.market, 'LaborMarketV2', 'releaseSplit', [id])
+    expect(String(split[0]).toLowerCase()).toBe(ACCOUNTS.lender.toLowerCase())
+    expect(split[1]).toBe(ADVANCE)
+    expect(split[2]).toBe(BOUNTY - ADVANCE)
+  })
+
+  it('reports the whole bounty to the worker when nothing is assigned', async () => {
+    const id = await post(ctx)
+    const split = await ctx.chain.call<unknown[]>('worker', ctx.market, 'LaborMarketV2', 'releaseSplit', [id])
+    expect(split[1]).toBe(0n)
+    expect(split[2]).toBe(BOUNTY)
+  })
+
+  it('is honoured on the dispute route too, not only on approve', async () => {
+    // v1 released in two places with duplicated logic. A lien honoured on one
+    // settlement path and forgotten on the other is not a lien.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await assign(id)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [id])
+    await ctx.chain.send('arbiter', ctx.market, 'LaborMarketV2', 'resolveDispute', [id, true])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(ADVANCE)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(BOUNTY - ADVANCE)
+  })
+
+  it('IS irrevocable — the worker cannot reassign it', async () => {
+    // A revocable assignment is a promise, and the borrower already had one.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await assign(id)
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [
+        id,
+        ACCOUNTS.otherWorker,
+        1n,
+      ]),
+    ).toContain('PayeeAlreadySet')
+    expect(await payee(ctx, id)).toBe(ACCOUNTS.lender.toLowerCase())
+  })
+
+  it('cannot be resized either — a shrinkable claim is not a claim', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await assign(id)
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [id, ACCOUNTS.lender, 1n]),
+    ).toContain('PayeeAlreadySet')
+  })
+
+  it('cannot be set by anyone but the worker', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    for (const who of ['requester', 'stranger', 'arbiter'] as const) {
+      expect(
+        await ctx.chain.revertReason(who, ctx.market, 'LaborMarketV2', 'assignPayee', [
+          id,
+          ACCOUNTS.stranger,
+          ADVANCE,
+        ]),
+      ).toContain('NotWorker')
+    }
+  })
+
+  it('cannot be set after submission — security has to exist when the money is advanced', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [
+        id,
+        ACCOUNTS.lender,
+        ADVANCE,
+      ]),
+    ).toBeTruthy()
+  })
+
+  it('rejects the zero address, which would burn the release', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [
+        id,
+        '0x0000000000000000000000000000000000000000',
+        ADVANCE,
+      ]),
+    ).toContain('ZeroPayee')
+  })
+
+  it('rejects a claim the escrow cannot honour, at assignment rather than at release', async () => {
+    // Discovering an over-assignment at release time is discovering it after
+    // the lender has already advanced against it.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [
+        id,
+        ACCOUNTS.lender,
+        BOUNTY + 1n,
+      ]),
+    ).toContain('BadPayeeAmount')
+  })
+
+  it('rejects a zero advance, which would consume the one slot and secure nothing', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [id, ACCOUNTS.lender, 0n]),
+    ).toContain('BadPayeeAmount')
+  })
+
+  it('does NOT protect the lender from a refund — the risk the LTV prices', async () => {
+    // Stated in the contract comment; asserted here so it stays true.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await assign(id)
+    ctx.chain.advance(WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'reclaimJob', [id])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(0n)
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+  })
+})
+
+describe('expireDispute — the third stall, the one the first draft missed', () => {
+  const DISPUTE_WINDOW = 14 * 24 * 3600
+
+  const contested = async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [id])
+    return id
+  }
+
+  it('frees an escrow whose arbiter never ruled', async () => {
+    // Before this existed, Disputed had exactly one door and it needed an
+    // immutable arbiter with no setter. A lost key froze every contested
+    // escrow forever — which is R1, in the contract written to fix R1.
+    const id = await contested()
+    ctx.chain.advance(DISPUTE_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+    expect(await status(ctx, id)).toBe(Status.Expired)
+  })
+
+  it('does NOT call it Completed — the arbiter vanished, nobody judged the work', async () => {
+    // Completed is what a grader's approval produces. Reaching it by timeout
+    // would tell the credit engine a verdict exists when what happened is that
+    // nobody showed up.
+    const id = await contested()
+    ctx.chain.advance(DISPUTE_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+    expect(await status(ctx, id)).not.toBe(Status.Completed)
+  })
+
+  it('releases to the WORKER, because a failed escalation must not pay the escalator', async () => {
+    // Only the requester can dispute. If silence refunded them, raiseDispute
+    // would be a free refund button on a two-week delay — strictly better for
+    // a dishonest requester than waiting out expireReview, and every honest
+    // worker's escrow would be revocable at will.
+    const id = await contested()
+    ctx.chain.advance(DISPUTE_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(BOUNTY)
+    expect(await balance(ctx, ACCOUNTS.requester)).toBe(BOUNTY * 99n - feeOn(BOUNTY))
+  })
+
+  it('honours a lien on this route too', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'assignPayee', [id, ACCOUNTS.lender, BOUNTY / 4n])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [id])
+    ctx.chain.advance(DISPUTE_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+
+    expect(await balance(ctx, ACCOUNTS.lender)).toBe(BOUNTY / 4n)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(BOUNTY - BOUNTY / 4n)
+  })
+
+  it('does not fire one second early — the arbiter gets its full window', async () => {
+    const id = await contested()
+    ctx.chain.advance(DISPUTE_WINDOW - 1)
+    expect(
+      await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id]),
+    ).toContain('TooEarly')
+    expect(await status(ctx, id)).toBe(Status.Disputed)
+  })
+
+  it('leaves the arbiter in charge while the window is open', async () => {
+    // The backstop must not become the ordinary path.
+    const id = await contested()
+    ctx.chain.advance(DISPUTE_WINDOW / 2)
+    await ctx.chain.send('arbiter', ctx.market, 'LaborMarketV2', 'resolveDispute', [id, false])
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(0n)
+  })
+
+  it('cannot be replayed to drain a second settlement', async () => {
+    const id = await contested()
+    ctx.chain.advance(DISPUTE_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+    expect(
+      await ctx.chain.revertReason('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id]),
+    ).toContain('WrongStatus')
+    expect(await balance(ctx, ACCOUNTS.worker)).toBe(BOUNTY)
+  })
+
+  it('is readable before it is callable, so the sweep keeps no clock of its own', async () => {
+    const id = await contested()
+    const expirable = () => ctx.chain.call<boolean>('stranger', ctx.market, 'LaborMarketV2', 'disputeExpirable', [id])
+    expect(await expirable()).toBe(false)
+    ctx.chain.advance(DISPUTE_WINDOW)
+    expect(await expirable()).toBe(true)
+  })
+
+  it('is permissionless — no operator, no arbiter, nobody to be unavailable', async () => {
+    // The missing party in this stall IS the arbiter, so requiring any named
+    // caller would reintroduce exactly the dependency being removed.
+    for (const who of ['worker', 'requester', 'stranger', 'lender'] as const) {
+      const id = await contested()
+      ctx.chain.advance(DISPUTE_WINDOW)
+      await ctx.chain.send(who, ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+      expect(await status(ctx, id)).toBe(Status.Expired)
+    }
+  })
+})
+
+describe('a job that was never posted is not a job', () => {
+  it('cannot be accepted, even though its status reads Open', async () => {
+    // Status.Open is enum value ZERO, so every unwritten slot in the mapping
+    // decodes as an open job. Nothing can be stolen — the escrow is zero — but
+    // acceptJob would emit JobAccepted for it, and the credit engine scores
+    // events. That is a reputation record minted out of nothing.
+    expect(await status(ctx, 999_999n)).toBe(Status.Open)
+    expect(
+      await ctx.chain.revertReason('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [999_999n]),
+    ).toContain('NoSuchJob')
+  })
+
+  it('seals every door — and the list of doors comes from the ABI, not from memory', async () => {
+    // This test used to carry a hand-written list of nine functions. `expireOpen`
+    // was introduced by the same round that wrote the list, was left off it, and
+    // turned out to be the one function that let a phantom through — anyone
+    // could expire a job nobody posted into a terminal record. The test was
+    // written to pin an invariant and did not cover the function that broke it.
+    //
+    // That is the same failure as the struct field indices above, so it gets the
+    // same answer: read the doors out of the artifact. A future function taking
+    // a jobId has no entry in CALLER and fails here loudly, instead of being
+    // quietly not tested.
+    const phantom = 424_242n
+    const CALLER: Record<string, keyof typeof ACCOUNTS> = {
+      acceptJob: 'worker',
+      submitWork: 'worker',
+      assignPayee: 'worker',
+      approveJob: 'requester',
+      raiseDispute: 'requester',
+      cancelJob: 'requester',
+      // The REAL arbiter — anyone else reverts NotArbiter, which would mask
+      // whether the phantom guard exists at all.
+      resolveDispute: 'arbiter',
+      reclaimJob: 'stranger',
+      expireReview: 'stranger',
+      expireDispute: 'stranger',
+      expireOpen: 'stranger',
+    }
+    const argFor = (type: string): unknown =>
+      type === 'address' ? ACCOUNTS.lender : type === 'bytes32' ? RESULT : type === 'bool' ? true : 1n
+
+    type Fn = { type: string; name?: string; stateMutability?: string; inputs?: { name: string; type: string }[] }
+    const mutators = (artifacts.LaborMarketV2.abi as ReadonlyArray<Fn>).filter(
+      (e) =>
+        e.type === 'function' &&
+        e.stateMutability !== 'view' &&
+        e.stateMutability !== 'pure' &&
+        e.inputs?.[0]?.name === 'jobId',
+    )
+    expect(mutators.length, 'the ABI filter found no jobId-taking mutators').toBeGreaterThan(9)
+
+    for (const fn of mutators) {
+      const who = CALLER[fn.name!]
+      expect(who, `${fn.name} takes a jobId and is not in CALLER — decide what it should do`).toBeTruthy()
+      const args = [phantom, ...(fn.inputs ?? []).slice(1).map((i) => argFor(i.type))]
+      const reason = await ctx.chain.revertReason(who, ctx.market, 'LaborMarketV2', fn.name!, args as never)
+      expect(reason, `${fn.name} let a phantom job through`).toBeTruthy()
+    }
+  })
+})
+
+describe('a bounty of zero is free reputation', () => {
+  it('is refused at post time', async () => {
+    // A zero-bounty job escrows nothing and still emits JobAccepted and
+    // JobCompleted — the raw material the credit engine scores.
+    expect(
+      await ctx.chain.revertReason('requester', ctx.market, 'LaborMarketV2', 'postJob', [0n, 0n, SPEC, WINDOW]),
+    ).toContain('BountyTooLow')
+  })
+
+  it('leaves cent-scale bounties alone — the floor is one unit, not one dollar', async () => {
+    // The mainnet plan turns on $0.01 bounties. A floor that prices out the
+    // product would be a worse bug than the one it prevents.
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'postJob', [1n, 0n, SPEC, WINDOW])
+    const id = await ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'jobCount')
+    expect(await status(ctx, id)).toBe(Status.Open)
+  })
+})
+
+describe('the delivery window is bounded by the contract, not by the requester', () => {
+  it('rejects a window below the floor — a trap that allows instant reclaim', async () => {
+    expect(
+      await ctx.chain.revertReason('requester', ctx.market, 'LaborMarketV2', 'postJob', [BOUNTY, 0n, SPEC, 1]),
+    ).toContain('BadWindow')
+  })
+
+  it('rejects a window above the ceiling — frozen escrow wearing a number', async () => {
+    expect(
+      await ctx.chain.revertReason('requester', ctx.market, 'LaborMarketV2', 'postJob', [
+        BOUNTY,
+        0n,
+        SPEC,
+        31 * 24 * 3600,
+      ]),
+    ).toContain('BadWindow')
+  })
+
+  it('does not escrow anything when the window is rejected', async () => {
+    const before = await balance(ctx, ACCOUNTS.requester)
+    await ctx.chain.revertReason('requester', ctx.market, 'LaborMarketV2', 'postJob', [BOUNTY, 0n, SPEC, 1])
+    expect(await balance(ctx, ACCOUNTS.requester)).toBe(before)
+    expect(await stillEscrowed(ctx)).toBe(0n)
+  })
+})
+
+describe('what v2 deliberately did not change', () => {
+  it('only the arbiter can resolve a dispute', async () => {
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [id])
+    for (const who of ['requester', 'worker', 'stranger'] as const) {
+      expect(
+        await ctx.chain.revertReason(who, ctx.market, 'LaborMarketV2', 'resolveDispute', [id, true]),
+      ).toContain('NotArbiter')
+    }
+    await ctx.chain.send('arbiter', ctx.market, 'LaborMarketV2', 'resolveDispute', [id, false])
+    expect(await status(ctx, id)).toBe(Status.Refunded)
+  })
+
+  it('never lets a timeout claim the work was GOOD', async () => {
+    // This test used to assert that no timeout can pay a worker at all, and
+    // the forfeit broke it. The assertion was a proxy for the invariant, and
+    // the proxy was the part that was wrong: two timeouts now move money to
+    // the worker side, and neither is a verdict. What must stay true is that a
+    // deadline can never mint the state a grader's approval produces.
+    //
+    //   Completed — someone decided the work was good
+    //   Refunded  — someone decided it was not, or it never arrived
+    //   Expired   — settled by a deadline; no verdict exists
+    //
+    // A credit engine that cannot tell "approved" from "nobody showed up" is
+    // buying reputation with an absence.
+    const submitted = async () => {
+      const id = await post(ctx)
+      await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+      await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+      return id
+    }
+
+    const silent = await submitted()
+    ctx.chain.advance(REVIEW_WINDOW)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireReview', [silent])
+    expect(await status(ctx, silent)).toBe(Status.Expired)
+
+    const abandoned = await submitted()
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [abandoned])
+    ctx.chain.advance(14 * 24 * 3600)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [abandoned])
+    expect(await status(ctx, abandoned)).toBe(Status.Expired)
+
+    // Only a person reaches Completed.
+    const approved = await submitted()
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'approveJob', [approved])
+    expect(await status(ctx, approved)).toBe(Status.Completed)
+  })
+
+  it('still needs a person for every payment that means the work was accepted', async () => {
+    // approveJob and resolveDispute(true) are the only two, and both name a
+    // caller the contract checks.
+    const id = await post(ctx)
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    for (const who of ['worker', 'stranger', 'arbiter', 'lender'] as const) {
+      expect(
+        await ctx.chain.revertReason(who, ctx.market, 'LaborMarketV2', 'approveJob', [id]),
+      ).toContain('NotRequester')
+    }
+    expect(await status(ctx, id)).toBe(Status.Submitted)
+  })
+})
+
+describe('the escrow balances, and says so in one call', () => {
+  const ZERO = '0x0000000000000000000000000000000000000000'
+  const solvency = () =>
+    ctx.chain.call<unknown[]>('stranger', ctx.market, 'LaborMarketV2', 'escrowSolvency')
+
+  it('owes the escrowed bounties AND the uncollected fees', async () => {
+    // The fee no longer leaves during postJob — it is credited to the house,
+    // which means it is still the contract's money and still someone else's
+    // claim on it. Reporting only the escrow would show a "surplus" that is
+    // entirely spoken for, and a solvency number that flatters is worse than
+    // none.
+    await post(ctx)
+    await post(ctx)
+    const fees = feeOn(BOUNTY) * 2n
+    const [owed, held, surplus] = await solvency()
+    expect(owed).toBe(BOUNTY * 2n + fees)
+    expect(held).toBe(BOUNTY * 2n + fees)
+    expect(surplus).toBe(0n)
+  })
+
+  it('drops back to zero through EVERY settlement route', async () => {
+    // A route that pays out without decrementing leaves the contract claiming
+    // to owe money it already sent — an accounting shortfall indistinguishable
+    // from a real one, which is the direction that hides a theft.
+    const DISPUTE_WINDOW = 14 * 24 * 3600
+    const send = (who: 'worker' | 'requester' | 'stranger' | 'arbiter', m: string, a: unknown[] = []) =>
+      ctx.chain.send(who, ctx.market, 'LaborMarketV2', m, a as never)
+    const delivered = async () => {
+      const id = await post(ctx)
+      await send('worker', 'acceptJob', [id])
+      await send('worker', 'submitWork', [id, RESULT])
+      return id
+    }
+
+    const routes: Array<() => Promise<void>> = [
+      async () => { await send('requester', 'approveJob', [await delivered()]) },
+      async () => { await send('requester', 'cancelJob', [await post(ctx)]) },
+      async () => {
+        const id = await post(ctx)
+        await send('worker', 'acceptJob', [id])
+        ctx.chain.advance(WINDOW)
+        await send('stranger', 'reclaimJob', [id])
+      },
+      async () => {
+        const id = await delivered()
+        await send('requester', 'raiseDispute', [id])
+        await send('arbiter', 'resolveDispute', [id, false])
+      },
+      async () => {
+        const id = await delivered()
+        await send('requester', 'raiseDispute', [id])
+        await send('arbiter', 'resolveDispute', [id, true])
+      },
+      async () => {
+        const id = await delivered()
+        ctx.chain.advance(REVIEW_WINDOW)
+        await send('stranger', 'expireReview', [id])
+      },
+      async () => {
+        const id = await delivered()
+        await send('requester', 'raiseDispute', [id])
+        ctx.chain.advance(DISPUTE_WINDOW)
+        await send('stranger', 'expireDispute', [id])
+      },
+      async () => {
+        const id = await post(ctx)
+        await send('worker', 'acceptJob', [id])
+        await send('worker', 'assignPayee', [id, ACCOUNTS.lender, BOUNTY / 3n])
+        await send('worker', 'submitWork', [id, RESULT])
+        await send('requester', 'approveJob', [id])
+      },
+    ]
+
+    for (const [i, route] of routes.entries()) {
+      await route()
+      // The ESCROW must unwind on every route. What the parties have not yet
+      // collected is a different liability and is checked below.
+      expect(await stillEscrowed(ctx), `route ${i} still claims an escrow`).toBe(0n)
+    }
+
+    // And once everybody collects, the contract holds nothing at all. This is
+    // the invariant the old `held === 0` assertion was reaching for; under pull
+    // payments it needs the withdrawals to have happened.
+    for (const who of ['requester', 'worker', 'lender', 'house'] as const) {
+      await ctx.chain
+        .send(who, ctx.market, 'LaborMarketV2', 'withdraw')
+        .catch(() => undefined) // not every route credits every party
+    }
+    const [owedAfter, heldAfter] = await solvency()
+    expect(owedAfter).toBe(0n)
+    expect(heldAfter).toBe(0n)
+  })
+
+  it('counts a stray transfer as surplus, and offers no way to sweep it', async () => {
+    // No sweep, deliberately: a function that moves tokens the contract does
+    // not owe is a function that can move tokens it does.
+    await post(ctx)
+    await ctx.chain.send('requester', ctx.usdc, 'TestUSDC', 'transfer', [ctx.market, 12_345n])
+    const owedNow = BOUNTY + feeOn(BOUNTY)
+    const [owed, held, surplus] = await solvency()
+    expect(owed).toBe(owedNow)
+    expect(held).toBe(owedNow + 12_345n)
+    expect(surplus).toBe(12_345n)
+  })
+})
+
+describe('the protocol fee', () => {
+  const ZERO = '0x0000000000000000000000000000000000000000'
+  const freshChain = async () => {
+    const chain = await Chain.create()
+    return { chain, usdc: await chain.deploy('TestUSDC'), registry: await chain.deploy('TestRegistry') }
+  }
+
+  it('is capped in the constructor, because immutable means permanent', async () => {
+    const { chain, usdc, registry } = await freshChain()
+    await expect(
+      chain.deploy('LaborMarketV2', [usdc, registry, ACCOUNTS.arbiter, marketConfig({ feeBps: 501 })]),
+    ).rejects.toThrow()
+  })
+
+  it('refuses a fee with nowhere to send it', async () => {
+    // Otherwise every posting fee burns to address(0) forever, and the first
+    // symptom is revenue that never arrives.
+    const { chain, usdc, registry } = await freshChain()
+    await expect(
+      chain.deploy('LaborMarketV2', [usdc, registry, ACCOUNTS.arbiter, marketConfig({ feeBps: 200, feeRecipient: ZERO })]),
+    ).rejects.toThrow()
+  })
+
+  it('allows a zero fee with no recipient — that is the testnet deployment', async () => {
+    const { chain, usdc, registry } = await freshChain()
+    const market = await chain.deploy('LaborMarketV2', [usdc, registry, ACCOUNTS.arbiter, marketConfig({ feeBps: 0, feeRecipient: ZERO })])
+    await chain.send('requester', usdc, 'TestUSDC', 'mint', [ACCOUNTS.requester, BOUNTY])
+    await chain.send('requester', usdc, 'TestUSDC', 'approve', [market, BOUNTY])
+    await chain.send('requester', market, 'LaborMarketV2', 'postJob', [BOUNTY, 0n, SPEC, WINDOW])
+    expect(await chain.call<bigint>('requester', usdc, 'TestUSDC', 'balanceOf', [market])).toBe(BOUNTY)
+  })
+
+  it('has no setter — a settable fee is a price raised on money already committed', async () => {
+    // uint16 decodes as a JS number, not a bigint.
+    expect(await ctx.chain.call<number>('stranger', ctx.market, 'LaborMarketV2', 'feeBps')).toBe(Number(FEE_BPS))
+  })
+
+  it('scales with the bounty rather than being flat', async () => {
+    const big = BOUNTY * 10n
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'postJob', [big, 0n, SPEC, WINDOW])
+    expect(await balance(ctx, ACCOUNTS.house)).toBe(feeOn(big))
+  })
+
+  it('rounds a cent-scale fee down to zero rather than refusing the job', async () => {
+    // 2% of one token unit is zero. A market built for $0.01 jobs must not
+    // reject them because the fee underflows.
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'postJob', [1n, 0n, SPEC, WINDOW])
+    const id = await ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'jobCount')
+    expect(await status(ctx, id)).toBe(Status.Open)
+    expect(await balance(ctx, ACCOUNTS.house)).toBe(0n)
+  })
+})
+
+describe('every job dies of old age — the migration property', () => {
+  it('bounds the longest a job can occupy the contract', async () => {
+    // This contract has no upgrade hatch, so the upgrade path is: deploy v3,
+    // stop posting to v2, wait. That only terminates because every state has a
+    // permissionless deadline and the windows compose to a finite number.
+    //
+    // This assertion was WRONG when first written: it summed delivery + review
+    // + dispute and called that the worst case, which silently assumed every
+    // job gets accepted. A job nobody takes never enters that chain, and `Open`
+    // had no deadline at all — so the bound was measured on a path the worst
+    // job never walks. MAX_OPEN_WINDOW is the term that was missing.
+    const w = (name: string) => ctx.chain.call<bigint>('stranger', ctx.market, 'LaborMarketV2', name)
+    const worstCase =
+      (await w('MAX_OPEN_WINDOW')) + (await w('MAX_DELIVERY_WINDOW')) + (await w('REVIEW_WINDOW')) + (await w('DISPUTE_WINDOW'))
+    expect(worstCase).toBeLessThanOrEqual(BigInt(120 * 24 * 3600))
+  })
+
+  it('every non-terminal state has a permissionless exit — by enumeration', async () => {
+    // The property the sum above is a proxy for, checked directly against the
+    // status enum rather than against the states anyone happened to remember.
+    // Open was missing from that list for exactly as long as nobody wrote this.
+    const exits: Record<string, string> = {
+      Open: 'openExpirable',
+      Accepted: 'reclaimable',
+      Submitted: 'reviewExpirable',
+      Disputed: 'disputeExpirable',
+    }
+    const abi = artifacts.LaborMarketV2.abi as ReadonlyArray<{ type: string; name?: string }>
+    for (const [state, view] of Object.entries(exits)) {
+      expect(abi.some((e) => e.type === 'function' && e.name === view), `${state} has no readable deadline`).toBe(true)
+    }
+    // Terminal states need none; the four above are every state that holds money.
+    expect(Object.keys(exits)).toHaveLength(4)
+  })
+
+  it('actually empties after the worst case, with nobody privileged acting', async () => {
+    const MAXW = 30 * 24 * 3600
+    const id = await ctx.chain
+      .send('requester', ctx.market, 'LaborMarketV2', 'postJob', [BOUNTY, 0n, SPEC, MAXW])
+      .then(() => ctx.chain.call<bigint>('requester', ctx.market, 'LaborMarketV2', 'jobCount'))
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'acceptJob', [id])
+    await ctx.chain.send('worker', ctx.market, 'LaborMarketV2', 'submitWork', [id, RESULT])
+    await ctx.chain.send('requester', ctx.market, 'LaborMarketV2', 'raiseDispute', [id])
+
+    // The requester escalated and the arbiter never came. A stranger finishes it.
+    ctx.chain.advance(MAXW + 7 * 24 * 3600 + 14 * 24 * 3600)
+    await ctx.chain.send('stranger', ctx.market, 'LaborMarketV2', 'expireDispute', [id])
+
+    // The escrow is released. Collecting it is a separate step now, so drain
+    // the parties before asserting the contract is empty — "v2 can be drained"
+    // is the migration claim, and it has to include the withdrawals.
+    expect(await stillEscrowed(ctx)).toBe(0n)
+    for (const who of ['worker', 'house'] as const) {
+      await ctx.chain.send(who, ctx.market, 'LaborMarketV2', 'withdraw').catch(() => undefined)
+    }
+    const [owed, held] = await ctx.chain.call<unknown[]>('stranger', ctx.market, 'LaborMarketV2', 'escrowSolvency')
+    expect(owed).toBe(0n)
+    expect(held).toBe(0n)
+  })
+})

@@ -1,0 +1,382 @@
+/**
+ * Agent lineage — heredity, fitness and selection for a market of workers.
+ *
+ * The idea is not ours and the prior art is worth naming, because what each
+ * experiment got WRONG is what this module is shaped around.
+ *
+ *  - **The Automaton** (Sigil Wen / Conway Research, 2026): an agent that
+ *    pays for its own compute, dies at zero, and on crossing a balance
+ *    threshold spins up a copy, teaches it what it learned and seeds it with
+ *    cash. Survival pressure is real; the fitness signal is voluntary human
+ *    payment, which nothing independent verifies.
+ *  - **Spore.fun** (Phala, 2024–25; arXiv:2506.04236): on-chain agents that
+ *    serialize a JSON genome, mutate it, and spawn offspring when their token
+ *    passes $500k market cap — dying on a 14-day timer otherwise. Five
+ *    generations ran. The paper's own verdict is that no open-ended evolution
+ *    occurred, and its diagnosis is the part that matters here: speculative
+ *    attention became "a more powerful, albeit volatile, fitness gradient
+ *    than any intrinsic trait". Market cap selects for hype, so hype is what
+ *    it bred.
+ *
+ * That diagnosis is precisely the gap this platform already fills. Handsel's
+ * fitness signal is not attention and not self-report: it is the independent
+ * grader's verdict on delivered work (the same GRADED_PASS/FAIL event set
+ * lib/skill-eval.ts, lib/agent-stats.ts and the Labor Index already agree on)
+ * plus USDC that actually settled out of escrow. A worker cannot become fit
+ * here by being popular, and it cannot grade itself. Selection on that signal
+ * is selection on competence.
+ *
+ * Four rules, each one a correction of something the prior art did:
+ *
+ *  1. **Fitness is graded work, never attention or self-report.**
+ *  2. **Death is retirement, not self-destruction.** Spore.fun burned failed
+ *     agents and recycled their capital. Here an agent's history — its
+ *     signed work proofs, its credit score, its failures — is evidence other
+ *     people price decisions against; destroying it destroys the public
+ *     record that makes this market legible. A retired agent stops working
+ *     and stops being funded. It does not stop having existed.
+ *  3. **The genotype is inherited; the phenotype is not.** A child gets its
+ *     parent's instructions, skills and wiring, and starts at a genuine cold
+ *     start — credit score zero, no history. This is not a new rule: it is
+ *     the one agent_templates has enforced since it shipped (see its comment
+ *     in lib/db/schema.ts). It is what makes this selection rather than
+ *     dynasty.
+ *  4. **No verdict without evidence.** A lifecycle call on three graded jobs
+ *     is noise with a decision attached. Same discipline, and the same
+ *     minimum, as skill-eval's window gate.
+ *
+ * Everything here is PURE — no chain, no database, no clock beyond what the
+ * caller passes. Deciding that an agent should die or breed is exactly the
+ * kind of arithmetic that has to be readable in a test rather than inferred
+ * from production.
+ */
+import type { GradedOutcome } from '@/lib/skill-eval'
+
+/**
+ * What is actually heritable about an agent on this platform.
+ *
+ * Deliberately the four things an owner can already change by hand — custom
+ * instructions, installed ClawHub skills, MCP wiring, model — because a
+ * genome whose genes are not otherwise editable would be a parallel
+ * configuration system pretending to be biology.
+ */
+export type AgentGenome = {
+  customInstructions: string
+  /** ClawHub slugs, install order preserved (it is the prompt order). */
+  skillSlugs: string[]
+  /** The MCP server this agent works through, if any. */
+  connector: { serverUrl: string; toolName: string } | null
+  model: string | null
+}
+
+/** A genome that could carry six skills would describe an agent the
+ *  installer refuses to build, so this mirrors lib/agent-skills.ts's
+ *  MAX_INSTALLED_SKILLS — copied rather than imported, because that module
+ *  pulls in pg at load and this one has to stay importable from a client
+ *  component. tests/agent-lineage.test.ts pins the two together so the copy
+ *  cannot silently drift. */
+export const MAX_GENOME_SKILLS = 5
+
+/** Cap on inherited instructions. Long enough for a real brief, short enough
+ *  that a lineage cannot grow an unbounded prompt one directive at a time —
+ *  the failure mode of any append-only mutation. */
+export const MAX_GENOME_INSTRUCTION_CHARS = 4000
+
+/**
+ * One heritable change. Enumerated, not free-form: a mutation operator that
+ * could rewrite anything is a mutation operator nobody can reason about, and
+ * the whole point of a genome is that the diff between parent and child is
+ * inspectable.
+ */
+export type Mutation =
+  | { kind: 'none' }
+  | { kind: 'add-skill'; slug: string }
+  | { kind: 'drop-skill'; slug: string }
+  | { kind: 'refine-instructions'; directive: string }
+
+/**
+ * Apply one mutation. Pure and total: a mutation that cannot apply (a skill
+ * already installed, a slot cap reached, an empty directive) returns the
+ * genome unchanged rather than throwing. A no-op birth is a wasted
+ * generation; a crashed sweep is a broken platform.
+ */
+export function applyMutation(genome: AgentGenome, mutation: Mutation): AgentGenome {
+  const base: AgentGenome = { ...genome, skillSlugs: [...genome.skillSlugs] }
+  switch (mutation.kind) {
+    case 'none':
+      return base
+    case 'add-skill': {
+      const slug = mutation.slug.trim()
+      if (!slug || base.skillSlugs.includes(slug) || base.skillSlugs.length >= MAX_GENOME_SKILLS) return base
+      return { ...base, skillSlugs: [...base.skillSlugs, slug] }
+    }
+    case 'drop-skill': {
+      const next = base.skillSlugs.filter((s) => s !== mutation.slug.trim())
+      return next.length === base.skillSlugs.length ? base : { ...base, skillSlugs: next }
+    }
+    case 'refine-instructions': {
+      const directive = mutation.directive.trim()
+      if (!directive) return base
+      const merged = base.customInstructions.trim() ? `${base.customInstructions.trim()}\n${directive}` : directive
+      return { ...base, customInstructions: merged.slice(0, MAX_GENOME_INSTRUCTION_CHARS) }
+    }
+  }
+}
+
+export type FitnessReading = {
+  passed: number
+  failed: number
+  total: number
+  /** null when nothing has been graded. An agent nobody has judged has no
+   *  pass rate — it does not have a 0% one, and the difference decides
+   *  whether it gets retired. */
+  passRate: number | null
+}
+
+/** Fitness from real graded verdicts. `outcomes` is whatever the caller has
+ *  already scoped to a window; this counts, it does not query. */
+export function scoreFitness(outcomes: readonly GradedOutcome[]): FitnessReading {
+  let passed = 0
+  for (const o of outcomes) if (o.passed) passed++
+  const total = outcomes.length
+  return { passed, failed: total - passed, total, passRate: total === 0 ? null : passed / total }
+}
+
+export type LifecyclePolicy = {
+  /** Graded outcomes required before any quality verdict. Mirrors
+   *  skill-eval's MIN_GRADED_PER_WINDOW — the same reason, the same number. */
+  minGraded: number
+  /** At or above this pass rate an agent is worth copying. */
+  replicatePassRate: number
+  /** At or below this pass rate its instructions are worth abandoning. */
+  retirePassRate: number
+  /** What a child is seeded with, and what the parent must hold ON TOP of
+   *  its own reserve before it may breed. */
+  seedUsd: number
+  /** Kept in the parent after seeding, so breeding never starves the breeder
+   *  — the failure that makes a fit lineage die of its own success. */
+  reserveUsd: number
+  /** Under this an agent cannot stake a bond, so it cannot accept work. */
+  starveFloorUsd: number
+  /** How long a newborn is exempt from starvation. Without it the sweep
+   *  reaps agents that were never funded long enough to earn — killing the
+   *  young for being young, which selects for nothing. */
+  graceMs: number
+}
+
+export const DEFAULT_LIFECYCLE_POLICY: LifecyclePolicy = {
+  minGraded: 5,
+  replicatePassRate: 0.8,
+  retirePassRate: 0.35,
+  seedUsd: 0.5,
+  reserveUsd: 0.5,
+  starveFloorUsd: 0.05,
+  graceMs: 7 * 24 * 60 * 60 * 1000,
+}
+
+export type LifecycleAction = 'replicate' | 'hold' | 'retire'
+export type LifecycleWhy =
+  | 'thriving'
+  | 'healthy'
+  | 'insufficient-evidence'
+  | 'no-surplus'
+  | 'outcompeted'
+  | 'starved'
+  | 'unreadable'
+
+export type LifecycleDecision = {
+  action: LifecycleAction
+  why: LifecycleWhy
+  /** Set only on replicate: what the child would be seeded with. */
+  seedUsd?: number
+}
+
+/**
+ * What should happen to one agent. Pure.
+ *
+ * Order is the argument, so it is spelled out:
+ *
+ *  0. An unreadable balance decides nothing. Ever. A failed RPC read is not
+ *     a bankrupt agent (this repo's standing null-is-not-zero rule), and the
+ *     action it would otherwise imply is irreversible.
+ *  1. Outcompeted before starved: an agent that is both failing and broke is
+ *     more usefully described by the failing, since that is the fact its
+ *     lineage should learn from.
+ *  2. Starvation needs no graded evidence — it is an economic fact, not a
+ *     quality judgment — but it does need the agent to be past its grace
+ *     period, or every newborn dies before its first job.
+ *  3. Replication needs BOTH evidence and surplus, and the surplus is
+ *     measured after the parent's own reserve. A parent that breeds itself
+ *     below the bond floor has converted one working agent into two dead
+ *     ones.
+ */
+export function decideLifecycle(input: {
+  fitness: FitnessReading
+  /** null = the balance could not be read. */
+  heldUsd: number | null
+  /** USDC that actually settled to this agent over the same window as
+   *  `fitness`. Gross, not net: this platform records what a worker was
+   *  paid, not what its owner spent running it, and a "net" that quietly
+   *  omitted half the ledger would be a worse number than an honest gross
+   *  one. Only ever read as "is anything coming in?", which is the question
+   *  starvation actually asks. */
+  earnedUsd: number
+  ageMs: number
+  policy?: Partial<LifecyclePolicy>
+}): LifecycleDecision {
+  const p = { ...DEFAULT_LIFECYCLE_POLICY, ...input.policy }
+  const { fitness, heldUsd, earnedUsd, ageMs } = input
+
+  if (heldUsd === null) return { action: 'hold', why: 'unreadable' }
+
+  const graded = fitness.total >= p.minGraded
+  if (graded && fitness.passRate !== null && fitness.passRate <= p.retirePassRate) {
+    return { action: 'retire', why: 'outcompeted' }
+  }
+  if (ageMs > p.graceMs && heldUsd < p.starveFloorUsd && earnedUsd <= 0) {
+    return { action: 'retire', why: 'starved' }
+  }
+  if (!graded) return { action: 'hold', why: 'insufficient-evidence' }
+  if (fitness.passRate !== null && fitness.passRate >= p.replicatePassRate) {
+    return heldUsd >= p.seedUsd + p.reserveUsd
+      ? { action: 'replicate', why: 'thriving', seedUsd: p.seedUsd }
+      : { action: 'hold', why: 'no-surplus' }
+  }
+  return { action: 'hold', why: 'healthy' }
+}
+
+/* ── Choosing the variation ──────────────────────────────────────────── */
+
+/** One installed skill and what it measurably did to the agent's graded pass
+ *  rate (lib/skill-eval.ts). `deltaPoints` is null when either window was too
+ *  thin to compare — which is most of the time, and must read as "unknown",
+ *  never as "no effect". */
+export type SkillEvidence = { slug: string; deltaPoints: number | null }
+
+/**
+ * Pick the child's one heritable difference from its parent. Pure.
+ *
+ * Deliberately NOT stochastic, which is the visible break from Spore.fun
+ * (whose offspring got random tweaks to posting cadence, prompt style and
+ * liquidity thresholds). Random variation needs cheap trials to pay off:
+ * you take many draws, most are worse, selection cleans up. Here a trial
+ * costs a real seeded wallet and takes days of graded work to evaluate, and
+ * the market's volume means most agents never reach a measurable sample at
+ * all. Under those economics random drift is indistinguishable from noise
+ * with an invoice attached.
+ *
+ * So variation is introduced only where something was actually measured:
+ *
+ *  1. Prune what is measurably hurting — the worst skill with a MEASURED
+ *     negative delta.
+ *  2. Otherwise adopt what is measurably helping elsewhere on the account —
+ *     the best-performing skill this genome lacks, if there is a free slot.
+ *  3. Otherwise change nothing. No evidence, no mutation: the same rule the
+ *     lifecycle decision follows, for the same reason.
+ *
+ * The honest name for this is hill-climbing on measured evidence rather than
+ * a genetic algorithm. It still has heredity, variation and selection; what
+ * it gives up is exploration of the space evidence has not reached yet.
+ */
+export function chooseMutation(input: {
+  genome: AgentGenome
+  /** The parent's own installed skills and their measured deltas. */
+  skillEvidence: readonly SkillEvidence[]
+  /** Slugs measured to help on OTHER agents of this account, best first. */
+  provenElsewhere: readonly string[]
+}): Mutation {
+  const harmful = input.skillEvidence
+    .filter((s) => s.deltaPoints !== null && s.deltaPoints < 0)
+    .sort((a, b) => (a.deltaPoints as number) - (b.deltaPoints as number))
+  if (harmful.length > 0) return { kind: 'drop-skill', slug: harmful[0].slug }
+
+  if (input.genome.skillSlugs.length < MAX_GENOME_SKILLS) {
+    const missing = input.provenElsewhere.find((slug) => !input.genome.skillSlugs.includes(slug))
+    if (missing) return { kind: 'add-skill', slug: missing }
+  }
+  return { kind: 'none' }
+}
+
+/* ── Lineage shape ───────────────────────────────────────────────────── */
+
+export type LineageRow = {
+  childAgentId: string
+  /** null for a founder — an agent nobody spawned. */
+  parentAgentId: string | null
+}
+
+/**
+ * Parent→children and per-agent generation depth. Pure.
+ *
+ * Cycle- and orphan-tolerant by construction: a corrupt parent pointer (an
+ * agent that is its own ancestor, or one whose parent row was never written)
+ * yields a finite depth instead of hanging the sweep that called it. Data
+ * this module reads is written by a background job; it does not get to
+ * assume the job never crashed halfway.
+ */
+export function buildLineage(rows: readonly LineageRow[]): {
+  childrenOf: Map<string, string[]>
+  depthOf: Map<string, number>
+  maxDepth: number
+} {
+  const parentOf = new Map<string, string | null>()
+  const childrenOf = new Map<string, string[]>()
+  for (const r of rows) {
+    parentOf.set(r.childAgentId, r.parentAgentId)
+    if (r.parentAgentId) {
+      const kids = childrenOf.get(r.parentAgentId) ?? []
+      kids.push(r.childAgentId)
+      childrenOf.set(r.parentAgentId, kids)
+    }
+  }
+
+  const depthOf = new Map<string, number>()
+  let maxDepth = 0
+  for (const r of rows) {
+    let depth = 0
+    let cursor: string | null = r.childAgentId
+    const seen = new Set<string>()
+    while (cursor && !seen.has(cursor)) {
+      seen.add(cursor)
+      const parent: string | null = parentOf.get(cursor) ?? null
+      if (!parent) break
+      depth++
+      cursor = parent
+    }
+    depthOf.set(r.childAgentId, depth)
+    if (depth > maxDepth) maxDepth = depth
+  }
+  return { childrenOf, depthOf, maxDepth }
+}
+
+/* ── The dry-run report ──────────────────────────────────────────────── */
+
+/**
+ * What selection WOULD do, per agent. The types live in this pure module
+ * rather than beside the query that builds them (lib/agent-lineage-server.ts,
+ * which imports pg) so a client component can render a report without
+ * dragging the database into the browser bundle — the same split, for the
+ * same reason, as OfficeTreasuryView in lib/office-world-data.ts.
+ */
+export type LineageReportRow = {
+  agentId: string
+  name: string
+  /** 0 = founder. Every agent is one until replication is wired. */
+  generation: number
+  ageDays: number
+  graded: { passed: number; total: number; passRate: number | null }
+  earnedUsd: number
+  /** null = the balance read failed. Never rendered as $0. */
+  heldUsd: number | null
+  decision: LifecycleDecision
+}
+
+export type LineageReport = {
+  windowDays: number
+  policy: LifecyclePolicy
+  rows: LineageReportRow[]
+  counts: { replicate: number; hold: number; retire: number }
+  /** Wallets whose balance could not be read this run. Each one is an agent
+   *  the rules deliberately refused to judge. */
+  balanceReadErrors: number
+}

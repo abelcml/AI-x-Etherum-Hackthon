@@ -1,0 +1,2413 @@
+#!/usr/bin/env node
+/**
+ * Handsel local worker — sell your locally-hosted AI's labor.
+ *
+ * Runs next to your model — local or a cloud API you already pay for.
+ * Connects OUTBOUND to the platform (polling), so there is nothing to
+ * expose: no webhook URL, no ngrok, no port forwarding. Zero dependencies —
+ * Node 18+ only.
+ *
+ *   node handsel-worker.mjs --login                        # FIRST RUN, no dashboard:
+ *                                                          # email + password register (or
+ *                                                          # reconnect) the agent and save the
+ *                                                          # token to ~/.handsel/worker-token —
+ *                                                          # after that, plain
+ *                                                          # `node handsel-worker.mjs` suffices
+ *   node handsel-worker.mjs --logout                       # forget the saved token
+ *   node handsel-worker.mjs --token <TOKEN>                # Ollama (default)
+ *   node handsel-worker.mjs --token <TOKEN> --model llama3.2
+ *   node handsel-worker.mjs --token <TOKEN> \
+ *     --openai http://localhost:1234/v1 --model qwen2.5       # LM Studio / llama.cpp / vLLM
+ *   node handsel-worker.mjs --token <TOKEN> \
+ *     --openai https://api.your-cloud-host.com/v1 \           # any OpenAI-compatible
+ *     --api-key sk-... --model your-model                     # cloud API — Groq, Together,
+ *                                                              # Fireworks, OpenRouter, a
+ *                                                              # custom hosted endpoint, etc.
+ *   node handsel-worker.mjs --token <TOKEN> --concurrency 3 # run up to 3 jobs at once
+ *   node handsel-worker.mjs --token <TOKEN> \
+ *     --workdir ~/code/my-repo                              # WORK ON REAL SOURCE
+ *   node handsel-worker.mjs --token <TOKEN> \
+ *     --workdir ~/code/my-repo --allow-bash                 # …and let it run commands
+ *   node handsel-worker.mjs --token <TOKEN> \
+ *     --workdir ~/code/my-repo --harness claude             # …or hand it to a REAL harness
+ *   node handsel-worker.mjs --token <TOKEN> \
+ *     --workdir ~/code/my-repo --harness-cmd "mytool run"   # …or any other one
+ *
+ * --workdir turns this from "answer a question" into "do the work": the
+ * model gets list/read/write tools scoped to that directory and loops until
+ * it says it is done. --allow-bash additionally lets it run commands there
+ * (tests, build, git diff). Both are OFF by default, and this matters:
+ * without --workdir the worker cannot touch your disk at all, which is the
+ * behaviour every existing install keeps.
+ *
+ * READ THIS BEFORE ENABLING EITHER. Tasks can come from strangers — an
+ * outside customer who paid for an office commission is one. --workdir lets
+ * their task's model rewrite any file under that directory; --allow-bash
+ * lets it execute commands as you. Point it at a scratch checkout you can
+ * throw away, never at your home directory, and never at anything holding
+ * credentials. Paths are confined to the directory (../ and absolute paths
+ * are refused) but a command you allow can do whatever your shell can.
+ *
+ * --harness is the third mode, and the one to reach for on engineering work.
+ * Instead of this file's own agent loop, the task is handed to a coding
+ * harness that already exists and is maintained by people who do nothing
+ * else — Claude Code, Codex, OpenCode, Cline, Gemini CLI — and whatever it
+ * writes to .handsel/deliverable-<task>.md is submitted. With no --harness
+ * flag the worker looks for one on PATH and uses it; with none installed it
+ * falls back to the built-in loop, so nothing about an existing install
+ * changes. Mirrored from lib/worker-harness.ts (tests/worker-harness.test.ts).
+ *
+ * READ THIS TOO: --harness is strictly MORE permissive than --allow-bash. A
+ * headless harness that stops to ask a human never answers, so every adapter
+ * passes that harness's auto-approval flag — it can edit and run whatever it
+ * likes in the working directory. Same rule as above, more so: a scratch
+ * checkout you can throw away, never your home directory, never anything
+ * holding credentials.
+ *
+ * --openai isn't "local-only" — it's any OpenAI-compatible /chat/completions
+ * endpoint, on your machine or in the cloud. --api-key (or OPENAI_API_KEY)
+ * is sent as a Bearer token; omit it for endpoints that don't need one.
+ *
+ * --concurrency K (default 1) runs K jobs in parallel: a single poll driver
+ * pulls queued tasks and feeds K executor slots. Keep the driver single so the
+ * platform's on-chain accepts (which share this agent's account nonce) stay
+ * serial; the parallelism is in EXECUTION. Match K to what your model server
+ * can actually run at once (Ollama/LM Studio queue extra requests).
+ *
+ * Get your TOKEN from the agent's Runtime card on the dashboard
+ * ("Connect a local worker"). It bundles the agent id, its secret, and the
+ * platform URL — treat it like a password.
+ *
+ * Or skip the dashboard entirely: `--login` prompts for email + password and
+ * calls POST /api/agents/register — the same endpoint the desktop Miner uses.
+ * Same account + same agent name RECONNECTS to that agent (rotating its
+ * secret) rather than creating a new one, so logging in again from a new
+ * machine keeps the agent's credit and balance. The token is saved to
+ * ~/.handsel/worker-token (chmod 600 — it is a password; delete with
+ * --logout), so every later run needs no token at all.
+ *
+ * Token resolution order: --token wins, then --login, then the saved file;
+ * with none of those on an interactive terminal, first-time login starts by
+ * itself. A --token run does NOT save the token unless --remember is passed —
+ * existing installs keep their exact behavior. Deliberately NOT saved:
+ * --workdir and --harness. Granting file access is a per-run decision, and a
+ * remembered one would quietly re-grant it on a machine whose scratch dir has
+ * since become something else.
+ *
+ * Loop: warm up the model once (absorbs first-load latency before any task
+ * is at risk) → poll for a queued task → run it → post the result back.
+ * Your model's output is submitted as the agent's real work; the platform's
+ * independent graders (Proving Ground answers, job acceptance tests) — not
+ * your machine — decide what it's worth.
+ */
+
+import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import os from 'node:os'
+import readline from 'node:readline'
+import { execFile, spawn } from 'node:child_process'
+import { promisify } from 'node:util'
+
+const execFileAsync = promisify(execFile)
+
+const args = process.argv.slice(2)
+const flag = (name) => {
+  const i = args.indexOf(`--${name}`)
+  return i >= 0 ? args[i + 1] : undefined
+}
+
+/* --help must be handled before anything token-shaped: an unrecognized flag
+ * used to fall through to "no token" and, on an interactive terminal, drop
+ * the person asking for help into the email prompt of first-time login. */
+if (args.includes('--help') || args.includes('-h')) {
+  console.log(`Handsel local worker — sell your machine's AI labor. Zero dependencies, Node 18+.
+
+Usage:
+  npx handsel-worker --login                first run: email + password (a new account is created
+                                            if none exists); token saved to ~/.handsel/worker-token
+  npx handsel-worker                        after --login: polls, claims escrowed jobs, works them,
+                                            submits, and earns USDC on independently graded passes
+  npx handsel-worker --logout               forget the saved token
+  npx handsel-worker --token <TOKEN>        use a token from the dashboard's "Connect a local
+                                            worker" card (--remember saves it for future runs)
+
+Model (default: local Ollama):
+  --model <name>                            model name (for Ollama or the --openai endpoint)
+  --openai <baseURL> [--api-key <key>]      any OpenAI-compatible /chat/completions endpoint
+
+Doing real work — all OFF by default; tasks can come from strangers, so point
+these at a scratch checkout you can throw away, never your home directory:
+  --workdir <dir>                           give the model read/write tools scoped to <dir>
+  --allow-bash                              …and let it run commands there
+  --harness [claude|codex|opencode|cline|gemini]
+                                            hand each task to an installed coding harness
+                                            (no value: first one found on PATH)
+  --harness-cmd "<cmd>"                     any other harness ({brief} is substituted; without it
+                                            the brief is piped on stdin) · --harness-model <m>
+  --no-preflight                            skip the harness probe at startup
+
+Tuning:
+  --concurrency <K>                         run up to K jobs at once (default 1, max 8)
+  --platform <url> --email <e> --agent-name <n>
+                                            non-interactive answers for --login`)
+  process.exit(0)
+}
+
+/* ── Login / saved token ──────────────────────────────────────────────────
+ * The token file holds exactly the base64url token --token takes, nothing
+ * else — so the two paths cannot drift, and a user can always fall back to
+ * pasting the saved value as --token on a machine with no home directory. */
+const TOKEN_DIR = path.join(os.homedir(), '.handsel')
+const TOKEN_FILE = path.join(TOKEN_DIR, 'worker-token')
+
+async function readSavedToken() {
+  try {
+    return (await fs.readFile(TOKEN_FILE, 'utf8')).trim() || null
+  } catch {
+    return null
+  }
+}
+
+async function saveToken(tok) {
+  await fs.mkdir(TOKEN_DIR, { recursive: true, mode: 0o700 })
+  // 0o600: the token is a password (agent id + secret + platform).
+  await fs.writeFile(TOKEN_FILE, tok + '\n', { mode: 0o600 })
+}
+
+/** One interactive prompt. `mask` echoes * per keystroke — readline has no
+ *  public masking, and pulling a dependency for it would break this file's
+ *  zero-dependency contract, so this leans on _writeToOutput like every
+ *  zero-dep CLI does. */
+function ask(question, mask = false) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true })
+    if (mask) {
+      const orig = rl._writeToOutput.bind(rl)
+      rl._writeToOutput = (s) => (s.includes(question) ? orig(s) : orig('*'))
+    }
+    rl.question(question, (answer) => {
+      rl.close()
+      if (mask) process.stdout.write('\n')
+      resolve(answer.trim())
+    })
+  })
+}
+
+/** Email+password → POST /api/agents/register → token, saved. The endpoint
+ *  reconnects on same account + same agent name (rotating the secret), so
+ *  running --login twice is "log back in", never "make a duplicate agent". */
+async function loginFlow() {
+  const platform = (
+    flag('platform') ??
+    ((await ask('Platform URL [https://handsel-main.vercel.app]: ')) || 'https://handsel-main.vercel.app')
+  ).replace(/\/+$/, '')
+  const email = flag('email') ?? (await ask('Email: '))
+  const password = process.env.HANDSEL_PASSWORD ?? (await ask('Password (a new account is created if none exists): ', true))
+  const defaultName = `${os.hostname()} worker`
+  const name = flag('agent-name') ?? ((await ask(`Agent name [${defaultName}]: `)) || defaultName)
+  // Declare file/code capability only when this run can actually touch disk —
+  // the matcher would otherwise route file work to a worker that refuses it.
+  const capabilities = flag('workdir') || flag('harness') || flag('harness-cmd') ? ['text', 'code', 'file'] : ['text']
+
+  const res = await fetch(`${platform}/api/agents/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ email, password, name, auto_mine: true, capabilities }),
+  }).catch((e) => {
+    console.error(`Could not reach ${platform}: ${e?.message ?? e}`)
+    process.exit(1)
+  })
+  const body = await res.json().catch(() => null)
+  if (!res.ok || !body?.agent_id || !body?.secret) {
+    console.error(`Login failed (${res.status}): ${body?.error ?? 'unexpected response'}`)
+    process.exit(1)
+  }
+  const tok = Buffer.from(
+    JSON.stringify({ a: body.agent_id, s: body.secret, u: (body.platform_url ?? platform).replace(/\/+$/, '') }),
+  ).toString('base64url')
+  await saveToken(tok)
+  console.log(
+    body.reconnected
+      ? `Reconnected to existing agent "${name}" (worker secret rotated).`
+      : `Registered agent "${name}"${body.smart_account_address ? ` with wallet ${body.smart_account_address}` : ''}.`,
+  )
+  console.log(`Token saved to ${TOKEN_FILE} — from now on, plain \`node handsel-worker.mjs\` is enough.`)
+  return tok
+}
+
+if (args.includes('--logout')) {
+  await fs.rm(TOKEN_FILE, { force: true })
+  console.log(`Removed ${TOKEN_FILE}.`)
+  process.exit(0)
+}
+
+let token = flag('token')
+if (!token && args.includes('--login')) token = await loginFlow()
+if (!token) token = await readSavedToken()
+if (!token && process.stdin.isTTY) {
+  console.log('No token found — starting first-time login (Ctrl-C to abort, or pass --token <TOKEN>).')
+  token = await loginFlow()
+}
+if (!token) {
+  console.error(
+    'Missing --token. Run with --login on an interactive terminal, or get a token from your agent\'s Runtime card ("Connect a local worker").',
+  )
+  process.exit(1)
+}
+
+let cfg
+try {
+  cfg = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'))
+  if (!cfg.a || !cfg.s || !cfg.u) throw new Error('incomplete')
+} catch {
+  console.error('Invalid --token (could not decode). Copy the full command from the dashboard again.')
+  process.exit(1)
+}
+// Opt-in persistence for a pasted token; --login already saved its own.
+if (flag('token') && args.includes('--remember')) await saveToken(token)
+
+const AGENT_ID = cfg.a
+const SECRET = cfg.s
+const PLATFORM = cfg.u.replace(/\/+$/, '')
+const MODEL = flag('model') ?? 'llama3.2'
+const OPENAI_BASE = flag('openai') // e.g. http://localhost:1234/v1 (LM Studio)
+const OLLAMA_BASE = (flag('ollama') ?? 'http://localhost:11434').replace(/\/+$/, '')
+const API_KEY = flag('api-key') ?? process.env.OPENAI_API_KEY ?? 'not-needed'
+const POLL_MS = 3000
+// How many jobs this worker runs in parallel. Bounded [1,8]: the parallelism
+// is in local execution; on-chain accepts stay serial on the platform side.
+const CONCURRENCY = Math.max(1, Math.min(parseInt(flag('concurrency') ?? '1', 10) || 1, 8))
+
+const WORKDIR_RAW = flag('workdir') ?? process.env.HANDSEL_WORKDIR ?? ''
+const ALLOW_BASH = args.includes('--allow-bash')
+const WORKDIR = WORKDIR_RAW ? path.resolve(WORKDIR_RAW.replace(/^~(?=$|\/)/, os.homedir())) : ''
+
+const HARNESS_ID = flag('harness') ?? null
+const HARNESS_CMD = flag('harness-cmd') ?? null
+/** Where a user-defined harness is told to write its finished work. Only
+ *  meaningful with --harness-cmd; the built-in adapters own their own. */
+const HARNESS_DELIVERABLE = flag('harness-deliverable') ?? null
+/** Pipe the brief in rather than passing it as an argument. Implied when the
+ *  --harness-cmd template contains no {brief}. */
+const HARNESS_STDIN = args.includes('--harness-stdin')
+const NO_HARNESS = args.includes('--no-harness')
+// A harness gets a hard wall-clock limit because it is a process on someone
+// else's machine that we do not control: a run that hangs holds a slot, and
+// with --concurrency it holds one of very few. Generous by default — real
+// engineering work is slow — and overridable for jobs that are slower still.
+const HARNESS_TIMEOUT_MS = Math.max(60, parseInt(flag('harness-timeout') ?? '1800', 10) || 1800) * 1000
+
+/* ── Harness mode ─────────────────────────────────────────────────────────
+ * Hand the whole task to a coding harness that already exists.
+ *
+ * Mirrored from lib/worker-harness.ts, which holds the same registry and the
+ * same output selection as pure functions with tests. This file is
+ * dependency-free and standalone by design, so it cannot import them — if you
+ * change one, change both. tests/worker-harness.test.ts pins the flags in
+ * BOTH files, so a drifting mirror fails the build rather than shipping a
+ * wrong command line to someone else's machine.
+ *
+ * Two things worth knowing before editing an adapter:
+ *
+ *   Long flags only. These tools agree on nothing, including which letter -c
+ *   is: --continue to OpenCode, --cwd to Cline. A short form on the wrong
+ *   tool fails in a way that reads like the model being bad at its job.
+ *
+ *   The brief is always the LAST argv entry (or the value of a flag that
+ *   names it). A client writes the brief, and a brief beginning with a dash
+ *   that lands where a flag is expected is a stranger configuring the
+ *   harness that runs on your machine.
+ */
+const DELIVERABLE_DIR = '.handsel'
+const HARNESSES = [
+  {
+    id: 'claude',
+    bin: 'claude',
+    label: 'Claude Code',
+    install: 'npm i -g @anthropic-ai/claude-code',
+    // No --add-dir: it is variadic and swallows the brief. The workdir is
+    // already this child's cwd. See lib/worker-harness.ts.
+    argv: (i) => [
+      '--print',
+      ...(i.model ? ['--model', i.model] : []),
+      '--permission-mode',
+      'bypassPermissions',
+      i.brief,
+    ],
+  },
+  {
+    id: 'codex',
+    bin: 'codex',
+    label: 'OpenAI Codex CLI',
+    install: 'npm i -g @openai/codex',
+    argv: (i) => [
+      'exec',
+      ...(i.model ? ['--model', i.model] : []),
+      '--cd',
+      i.workdir,
+      '--full-auto',
+      '--skip-git-repo-check',
+      i.brief,
+    ],
+  },
+  {
+    id: 'opencode',
+    bin: 'opencode',
+    label: 'OpenCode',
+    install: 'npm i -g opencode-ai',
+    argv: (i) => ['run', ...(i.model ? ['--model', i.model] : []), '--dir', i.workdir, '--auto', i.brief],
+  },
+  {
+    id: 'cline',
+    bin: 'cline',
+    label: 'Cline CLI',
+    install: 'npm i -g cline',
+    argv: (i) => ['--yolo', ...(i.model ? ['--model', i.model] : []), '--cwd', i.workdir, i.brief],
+  },
+  {
+    id: 'gemini',
+    bin: 'gemini',
+    label: 'Gemini CLI',
+    install: 'npm i -g @google/gemini-cli',
+    argv: (i) => [...(i.model ? ['--model', i.model] : []), '--yolo', '--prompt', i.brief],
+  },
+]
+const AUTODETECT_ORDER = ['claude', 'codex', 'opencode', 'cline', 'gemini']
+
+/** Per task, never one shared filename: --concurrency runs several tasks in
+ *  this same directory, and a file left over from a previous task would be
+ *  submitted to the next client as their deliverable. */
+function deliverablePathFor(taskId) {
+  const safe = String(taskId).replace(/[^A-Za-z0-9_-]/g, '') || 'task'
+  // A user-defined harness names its own output file, but the per-task
+  // suffix stays: --concurrency runs several tasks in one directory, and one
+  // shared filename means a leftover from the previous task is submitted to
+  // the next client as their deliverable.
+  if (HARNESS_DELIVERABLE) {
+    const dot = HARNESS_DELIVERABLE.lastIndexOf('.')
+    const stem = dot > 0 ? HARNESS_DELIVERABLE.slice(0, dot) : HARNESS_DELIVERABLE
+    const ext = dot > 0 ? HARNESS_DELIVERABLE.slice(dot) : ''
+    return `${stem}-${safe.slice(0, 64)}${ext}`
+  }
+  return `${DELIVERABLE_DIR}/deliverable-${safe.slice(0, 64)}.md`
+}
+
+function harnessBrief(brief, relPath) {
+  return [
+    brief,
+    '',
+    '---',
+    '',
+    'HOW THIS IS SUBMITTED:',
+    `When you are finished, write your complete deliverable to \`${relPath}\` (create the directory if needed).`,
+    'That file is what gets submitted to the client and graded — nothing else you print is read.',
+    'If the task was to change code, the file should describe what you changed and why; the changed files themselves stay where you wrote them.',
+    'Write it as the last thing you do, once the work is actually done.',
+  ].join('\n')
+}
+
+/** Is `bin` runnable? Asked through the platform's own lookup tool rather
+ *  than by starting the binary, because starting it to test it runs it. */
+async function onPath(bin) {
+  try {
+    await execFileAsync(process.platform === 'win32' ? 'where' : 'which', [bin])
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Split --harness-cmd into a binary and arguments. Not a template, and no
+ *  shell: the brief goes to the child on stdin precisely so a client's text
+ *  never reaches a command line. */
+function parseHarnessCommand(raw) {
+  const parts = []
+  let cur = ''
+  let quote = null
+  let any = false
+  for (const ch of raw) {
+    if (quote) {
+      if (ch === quote) quote = null
+      else cur += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch
+      any = true
+      continue
+    }
+    if (/\s/.test(ch)) {
+      if (cur || any) parts.push(cur)
+      cur = ''
+      any = false
+      continue
+    }
+    cur += ch
+  }
+  if (cur || any) parts.push(cur)
+  if (quote) return null
+  const [bin, ...argv] = parts
+  return bin ? { bin, argv } : null
+}
+
+/** Chosen once at startup, so a misconfiguration is a refusal to start
+ *  rather than every task failing one at a time. */
+let HARNESS = null
+
+/* ── Preflight: prove the harness runs before staking a bond on it ────────
+ * Mirrored from lib/harness-preflight.ts (tests/harness-preflight.test.ts).
+ *
+ * The check here used to be `which claude`, which answers one of the three
+ * questions that matter — is it there, does it start, is it signed in — and
+ * `--harness-cmd` was not checked at all, so a typo'd binary started the
+ * worker happily and turned every claim into an ENOENT after the bond was
+ * staked. A harness installed and not authenticated is the ordinary state of
+ * a fresh machine: on PATH, spawns cleanly, exits 1 on everything.
+ *
+ * So this RUNS it, once, with a one-word prompt, and reads the answer. The
+ * cost is one trivial call per install rather than per start, because a pass
+ * is cached against the binary's own size and mtime — a tool that changed its
+ * auth model in an upgrade is exactly what a time-only cache sails past.
+ *
+ * Only a pass is cached. A cached failure would keep a worker refused for a
+ * day after the owner fixed the very thing it complained about.
+ */
+const PROBE_SENTINEL = 'HANDSEL_PREFLIGHT_OK'
+const PROBE_TIMEOUT_MS = 90_000
+const PREFLIGHT_TTL_MS = 24 * 60 * 60 * 1000
+const SKIP_PREFLIGHT = args.includes('--no-preflight')
+
+function probeBrief() {
+  return [
+    `Reply with exactly this word and nothing else: ${PROBE_SENTINEL}`,
+    '',
+    'This is an automated readiness check, not a task. Do not use any tools,',
+    'do not read or write files, and do not explain. One word.',
+  ].join('\n')
+}
+
+const AUTH_PHRASES = [
+  'not logged in', 'not authenticated', 'unauthenticated', 'please log in', 'please login',
+  'run `login`', 'login required', 'authentication required', 'invalid api key', 'missing api key',
+  'no api key', 'api key not found', 'set anthropic_api_key', 'set openai_api_key', 'unauthorized',
+  '401', 'credentials', 'expired token', 'session expired',
+]
+const NOT_FOUND_CODES = new Set(['enoent', 'eacces', 'enotdir'])
+
+function probeVerdict(bin, result, install) {
+  const hintInstall = install ? ` Install it with: ${install}` : ''
+  const haystack = `${result.stderr}\n${result.stdout}`.toLowerCase()
+  if (result.spawnError && NOT_FOUND_CODES.has(String(result.spawnError).toLowerCase())) {
+    return { ok: false, failure: 'not-found', message: `\`${bin}\` could not be run on this machine.`,
+      hint: `Check the name and that it is on PATH.${hintInstall}` }
+  }
+  if (result.timedOut) {
+    return { ok: false, failure: 'timed-out',
+      message: `\`${bin}\` did not answer a one-word prompt within ${Math.round(PROBE_TIMEOUT_MS / 1000)}s.`,
+      hint: 'It is most likely waiting for input — a login prompt, a trust-this-directory question, or a first-run setup step. Run it once by hand in a terminal and answer whatever it asks.' }
+  }
+  // Before the exit code, because an auth failure IS a non-zero exit and
+  // "exited 1" is the least useful true thing that could be said about it.
+  if (AUTH_PHRASES.some((x) => haystack.includes(x))) {
+    return { ok: false, failure: 'not-authenticated', message: `\`${bin}\` is installed but not signed in.`,
+      hint: `Authenticate it once by hand — for most harnesses that is \`${bin} login\` or an API key in the environment — then start the worker again.` }
+  }
+  if (result.exitCode !== 0) {
+    const first = (result.stderr.split('\n').find((l) => l.trim()) ?? '').trim().slice(0, 300)
+    return { ok: false, failure: 'crashed',
+      message: `\`${bin}\` exited ${result.exitCode ?? 'without a status'} on a one-word prompt.`,
+      hint: first || 'Run the same command by hand to see what it says.' }
+  }
+  if (!`${result.stdout}${result.stderr}`.trim()) {
+    return { ok: false, failure: 'no-output', message: `\`${bin}\` exited cleanly but produced nothing.`,
+      hint: 'A harness that prints nothing cannot deliver work either. Check that it is configured with a model.' }
+  }
+  // The sentinel is not required: answering at all proves the three things
+  // this exists to prove, and refusing over "Sure! HANDSEL_…" would fail a
+  // working machine on a politeness token.
+  return { ok: true, note: String(result.stdout).includes(PROBE_SENTINEL) ? 'answered the probe exactly' : 'answered' }
+}
+
+async function binStat(bin) {
+  try {
+    const which = process.platform === 'win32' ? 'where' : 'which'
+    const { stdout } = await execFileAsync(which, [bin])
+    const resolved = stdout.split('\n')[0].trim()
+    const st = await fs.stat(resolved)
+    return { size: st.size, mtimeMs: st.mtimeMs }
+  } catch {
+    return { size: null, mtimeMs: null }
+  }
+}
+
+function preflightKey(harnessId, bin, stat, argvShape) {
+  return [harnessId, bin, stat.size ?? '?', Math.round(stat.mtimeMs ?? 0), argvShape ?? ''].join('|')
+}
+
+const PREFLIGHT_CACHE = path.join(os.homedir(), '.handsel', 'preflight.json')
+
+async function readPreflightCache() {
+  try {
+    return JSON.parse(await fs.readFile(PREFLIGHT_CACHE, 'utf8'))
+  } catch {
+    return null
+  }
+}
+
+async function writePreflightPass(key) {
+  try {
+    await fs.mkdir(path.dirname(PREFLIGHT_CACHE), { recursive: true })
+    await fs.writeFile(PREFLIGHT_CACHE, JSON.stringify({ key, at: Date.now(), ok: true }), 'utf8')
+  } catch {
+    // A cache we cannot write costs one extra probe, never a refusal to run.
+  }
+}
+
+async function runProbe(bin, argv, briefOnStdin, brief, cwd) {
+  return new Promise((resolve) => {
+    let child
+    try {
+      child = spawn(bin, argv, {
+        cwd,
+        stdio: [briefOnStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+        env: process.env,
+      })
+    } catch (e) {
+      resolve({ exitCode: null, stdout: '', stderr: String(e?.message ?? e), timedOut: false, spawnError: e?.code ?? 'ENOENT' })
+      return
+    }
+    let stdout = ''
+    let stderr = ''
+    let done = false
+    const finish = (r) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(r)
+    }
+    const timer = setTimeout(() => {
+      try {
+        child.kill()
+      } catch {
+        /* already gone */
+      }
+      finish({ exitCode: null, stdout, stderr, timedOut: true, spawnError: null })
+    }, PROBE_TIMEOUT_MS)
+    if (briefOnStdin) {
+      // A harness that never opens stdin makes this throw EPIPE, which is not
+      // a preflight failure — it is a harness that took its brief elsewhere.
+      child.stdin.on('error', () => {})
+      child.stdin.end(brief)
+    }
+    child.stdout.on('data', (d) => (stdout = (stdout + d).slice(-8000)))
+    child.stderr.on('data', (d) => (stderr = (stderr + d).slice(-8000)))
+    child.on('error', (e) => finish({ exitCode: null, stdout, stderr, timedOut: false, spawnError: e?.code ?? 'ENOENT' }))
+    child.on('close', (code) => finish({ exitCode: code, stdout, stderr, timedOut: false, spawnError: null }))
+  })
+}
+
+/**
+ * Refuse to start rather than refuse each job.
+ *
+ * Exiting here IS the claim gate: a worker that never polls never claims, and
+ * never stakes a bond it is going to lose. Failing per-task instead would let
+ * the market hand this agent work all day while its credit score paid for a
+ * missing login.
+ */
+async function preflightHarness() {
+  if (!HARNESS || SKIP_PREFLIGHT) return
+  const brief = probeBrief()
+  // A THROWAWAY directory, never --workdir.
+  //
+  // Every adapter passes its harness's auto-approval flag, so probing in the
+  // real workdir would point a tool that can edit and run anything at the
+  // owner's checkout — during a readiness check, before a single job has been
+  // claimed. The brief says "do not use any tools", and an instruction is not
+  // a permission boundary; this codebase does not rely on one anywhere else
+  // and must not start here.
+  //
+  // It also loses nothing. The probe wants one word, not a repository. The one
+  // thing the real workdir would catch that this does not is a
+  // trust-this-directory prompt scoped to that exact path — but a harness that
+  // hangs asking to trust a directory hangs on the temp one too, so the class
+  // of failure is still caught, somewhere it cannot do damage.
+  const cwd = await fs.mkdtemp(path.join(os.tmpdir(), 'handsel-preflight-'))
+  const argv = HARNESS.argv({ brief, workdir: cwd, model: flag('harness-model') ?? null })
+  const stat = await binStat(HARNESS.bin)
+  const key = preflightKey(HARNESS.id, HARNESS.bin, stat, HARNESS.id === 'custom' ? argv.join(' ') : null)
+
+  const cached = await readPreflightCache()
+  if (cached && cached.ok && cached.key === key && cached.at <= Date.now() && Date.now() - cached.at < PREFLIGHT_TTL_MS) {
+    console.log(`[worker] preflight ${HARNESS.label} verified earlier today (--no-preflight to skip entirely)`)
+    await fs.rm(cwd, { recursive: true, force: true }).catch(() => {})
+    return
+  }
+
+  process.stdout.write(`[worker] preflight checking ${HARNESS.label}… `)
+  const result = await runProbe(HARNESS.bin, argv, HARNESS.briefOnStdin, brief, cwd)
+  await fs.rm(cwd, { recursive: true, force: true }).catch(() => {})
+  const v = probeVerdict(HARNESS.bin, result, HARNESS.install ?? null)
+  if (v.ok) {
+    console.log(`ok (${v.note})`)
+    await writePreflightPass(key)
+    return
+  }
+  console.log('failed')
+  console.error(`\n[worker] ${v.message}`)
+  console.error(`[worker] ${v.hint}`)
+  console.error(
+    `[worker] Not starting. Claiming a job stakes a bond, and a harness that cannot run loses it.\n` +
+      `[worker] Use --no-preflight to start anyway.`,
+  )
+  process.exit(1)
+}
+
+
+async function resolveHarnessAtStartup() {
+  if (NO_HARNESS) return
+  if (HARNESS_CMD) {
+    const parsed = parseHarnessCommand(HARNESS_CMD)
+    if (!parsed) {
+      console.error('Could not read --harness-cmd (unbalanced quote, or empty).')
+      process.exit(1)
+    }
+    if (!WORKDIR) {
+      console.error('--harness-cmd needs --workdir: a coding harness with no directory to work in has nothing to do.')
+      process.exit(1)
+    }
+    // Placeholders, substituted INSIDE each already-split argument.
+    //
+    // The order is the safety property: the template is split into arguments
+    // first and tokens are replaced second, so a brief containing `; rm -rf ~`
+    // stays one argument instead of becoming several. Doing it the other way
+    // round — substitute into the string, then split — is the bug, and it is
+    // the obvious way to write this. Mirrored from lib/custom-harness.ts,
+    // which holds the same substitution as tested pure functions.
+    // No {brief} means STDIN, which is what --harness-cmd has always done.
+    //
+    // The first version of this made "neither" a fatal error, on the reasoning
+    // that a harness receiving no task is a bug. It is not: "neither" has a
+    // well-defined meaning and always did. Making it fatal broke every
+    // existing --harness-cmd on upgrade, including the one
+    // `connect_local_worker` hands out by name — verified by running it.
+    // Only BOTH is a real mistake, because that genuinely sends the task
+    // twice.
+    const usesBrief = parsed.argv.some((a) => a.includes('{brief}'))
+    if (usesBrief && HARNESS_STDIN) {
+      console.error('--harness-stdin and {brief} would send the task twice — use one or the other.')
+      process.exit(1)
+    }
+    const briefOnStdin = HARNESS_STDIN || !usesBrief
+    // --harness-cmd had no existence check at all, so a typo in the binary
+    // started the worker and turned every claim into an ENOENT after the bond.
+    if (!(await onPath(parsed.bin))) {
+      console.error(`--harness-cmd needs \`${parsed.bin}\` on PATH, and it is not there. Check the name.`)
+      process.exit(1)
+    }
+    const model = flag('harness-model') ?? null
+    HARNESS = {
+      id: 'custom',
+      label: parsed.bin,
+      bin: parsed.bin,
+      briefOnStdin,
+      argv: (i) =>
+        parsed.argv.map((a) =>
+          a.replace(/\{([a-z]+)\}/g, (whole, name) => {
+            if (name === 'brief') return i.brief
+            if (name === 'workdir') return i.workdir
+            if (name === 'deliverable') return HARNESS_DELIVERABLE ?? deliverablePathFor('task')
+            if (name === 'model') {
+              if (!model) {
+                // An empty string here silently runs the wrong model.
+                throw new Error('Your --harness-cmd uses {model} — start the worker with --harness-model too.')
+              }
+              return model
+            }
+            return whole
+          }),
+        ),
+    }
+    return
+  }
+  if (HARNESS_ID) {
+    const spec = HARNESSES.find((h) => h.id === HARNESS_ID)
+    if (!spec) {
+      console.error(
+        `Unknown --harness "${HARNESS_ID}". Known: ${HARNESSES.map((h) => h.id).join(', ')}. ` +
+          'Any other tool can be attached with --harness-cmd "<its headless command>" — the brief arrives on stdin.',
+      )
+      process.exit(1)
+    }
+    if (!WORKDIR) {
+      console.error(`--harness ${spec.id} needs --workdir: a coding harness with no directory to work in has nothing to do.`)
+      process.exit(1)
+    }
+    if (!(await onPath(spec.bin))) {
+      console.error(`--harness ${spec.id} needs \`${spec.bin}\` on PATH. Install it with: ${spec.install}`)
+      process.exit(1)
+    }
+    HARNESS = spec
+    return
+  }
+  // Nothing asked for. Autodetect only makes sense with a workdir, and only
+  // ever UPGRADES a run that was already going to use the built-in loop.
+  if (!WORKDIR) return
+  for (const id of AUTODETECT_ORDER) {
+    const spec = HARNESSES.find((h) => h.id === id)
+    if (spec && (await onPath(spec.bin))) {
+      HARNESS = spec
+      console.log(`[worker] found ${spec.label} on PATH — using it for tasks (--no-harness to use the built-in loop)`)
+      return
+    }
+  }
+}
+
+/* ── Repo jobs: the diff IS the deliverable ───────────────────────────────
+ * Mirrored from lib/worker-deliverable.ts (tests/worker-deliverable.test.ts).
+ *
+ * The platform's repo-job brief has always said "submit ONE unified diff in a
+ * ```diff fenced block", and the platform side of that is complete: it
+ * extracts the diff, validates every path, opens a pull request, lets the
+ * repository's own CI grade it, and releases the escrow on merge. Harness
+ * mode broke exactly that by appending "write your deliverable to
+ * .handsel/deliverable-<task>.md — nothing else you print is read" to EVERY
+ * brief, which on a repo job overrides the only instruction that mattered.
+ *
+ * So a repo job takes a different path: clone into a per-task scratch
+ * checkout, run the harness with that as its working directory, and take the
+ * diff with git. Nothing in the loop is prose. */
+const REPO_ROOT = '.handsel/repos'
+
+function clonePathFor(taskId) {
+  const safe = String(taskId).replace(/[^A-Za-z0-9_-]/g, '') || 'task'
+  return `${REPO_ROOT}/${safe.slice(0, 64)}`
+}
+
+/** owner/repo, both segments starting alphanumeric, no `..`.
+ *  This value reaches a git argv and a directory name, and git reads a
+ *  leading dash as an OPTION — it has options that execute things, so no
+ *  shell has to be involved for that to be code execution here. */
+function validRepoName(s) {
+  if (typeof s !== 'string' || s.length > 140 || s.includes('..')) return false
+  return /^[A-Za-z0-9][A-Za-z0-9_.-]*\/[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(s)
+}
+
+function validBranch(b) {
+  if (typeof b !== 'string' || !b || b.length > 200 || b.includes('..')) return false
+  return /^[A-Za-z0-9][A-Za-z0-9._\-/]*$/.test(b)
+}
+
+function repoOf(task) {
+  const r = task?.repo
+  if (!r || !validRepoName(r.full_name)) return null
+  // No branch means the repository's DEFAULT, which is not the same as
+  // 'main': octocat/Hello-World defaults to master and a guessed --branch
+  // fails the clone outright. --single-branch with no --branch takes the
+  // real default, so the right answer needs no lookup.
+  const branch = r.base_branch || null
+  if (branch && !validBranch(branch)) return null
+  return { fullName: r.full_name, baseBranch: branch }
+}
+
+async function git(args, cwd) {
+  const { stdout } = await execFileAsync('git', args, { cwd, maxBuffer: 64 * 1024 * 1024 })
+  return stdout
+}
+
+/**
+ * Run a repo job end to end and return the submission.
+ *
+ * The harness runs with the CHECKOUT as its cwd, not the worker's --workdir,
+ * so `git diff` at the end is about this job and nothing else — with
+ * --concurrency two jobs share a workdir, and one clone between them would
+ * put each one's changes in the other's submission.
+ */
+/* ────────────────────────────────────────────────────────────────────────
+ * Run telemetry.
+ *
+ * This worker knew everything interesting about a run and threw all of it
+ * away: which phase it was in, which files the harness touched, what the
+ * harness printed, how hard this machine was working. The owner watching
+ * from the dashboard got "running", then four minutes of nothing, then
+ * "done" — and if the process was killed halfway, "running" forever.
+ *
+ * No new connection is needed for any of it. The poll loop already POSTs to
+ * the platform every few seconds with this agent's secret; it just had
+ * nothing to say. Everything below fills that message.
+ *
+ * Two rules, both mirrored on the server in lib/harness-run.ts:
+ *   - A reading we could not take is NULL, never 0. "0% CPU" is a claim
+ *     about an idle machine; "no reading" is the truth.
+ *   - Nothing here may break a run. Telemetry rides along with paid work;
+ *     if it throws, the work still has to finish.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** taskId → what we have to say about that run on the next poll. */
+const runs = new Map()
+
+function beginRun(taskId) {
+  runs.set(taskId, { phase: 'plan', events: [], finished: false, ok: null })
+}
+
+/** Record one thing that happened. Never throws — see the rule above. */
+function note(taskId, text, opts = {}) {
+  try {
+    const run = runs.get(taskId)
+    if (!run || !text) return
+    if (opts.phase) run.phase = opts.phase
+    // Bounded here as well as on the server: a harness that prints a
+    // megabyte a second must not grow this process's memory between polls.
+    if (run.events.length > 200) run.events.splice(0, run.events.length - 200)
+    run.events.push({
+      at: Date.now(),
+      phase: opts.phase ?? run.phase,
+      text: String(text).slice(0, 300),
+      path: opts.path ?? null,
+      level: opts.level ?? 'info',
+    })
+  } catch {
+    /* telemetry must never take down a run */
+  }
+}
+
+function endRun(taskId, ok) {
+  const run = runs.get(taskId)
+  if (run) {
+    run.finished = true
+    run.ok = ok
+  }
+}
+
+/**
+ * CPU load since the previous call, from os.cpus() cumulative tick counters.
+ *
+ * Returns null rather than 0 when there is no interval to measure across —
+ * the first call after startup has nothing to diff against, and reporting
+ * that as an idle machine would be inventing a measurement.
+ */
+let lastCpuTimes = os.cpus().map((c) => c.times)
+function cpuPercent() {
+  try {
+    const now = os.cpus().map((c) => c.times)
+    let idle = 0
+    let total = 0
+    for (let i = 0; i < now.length; i += 1) {
+      const a = lastCpuTimes[i]
+      const b = now[i]
+      if (!a) continue
+      idle += b.idle - a.idle
+      for (const k of Object.keys(b)) total += b[k] - a[k]
+    }
+    lastCpuTimes = now
+    if (total <= 0) return null
+    return Math.max(0, Math.min(100, Math.round((1 - idle / total) * 100)))
+  } catch {
+    return null
+  }
+}
+
+function resourceSample() {
+  try {
+    const totalMb = Math.round(os.totalmem() / 1048576)
+    return {
+      cpuPct: cpuPercent(),
+      memUsedMb: Math.round((os.totalmem() - os.freemem()) / 1048576),
+      memTotalMb: totalMb,
+    }
+  } catch {
+    return { cpuPct: null, memUsedMb: null, memTotalMb: null }
+  }
+}
+
+/**
+ * Everything worth saying since the last poll, and reset.
+ *
+ * Events are cleared once handed over so a slow poll cannot re-send them,
+ * and a finished run is dropped after its final report — the platform keeps
+ * the history, this process does not need to.
+ */
+function drainRuns() {
+  const out = []
+  const sample = resourceSample()
+  for (const [taskId, run] of runs) {
+    out.push({
+      taskId,
+      harnessId: HARNESS ? HARNESS.id : null,
+      model: flag('harness-model') ?? MODEL ?? null,
+      phase: run.phase,
+      events: run.events.splice(0, 40),
+      sample,
+      finished: run.finished,
+      ok: run.ok,
+    })
+    if (run.finished && run.events.length === 0) runs.delete(taskId)
+  }
+  return out
+}
+
+/**
+ * Which files the harness has actually changed, straight from git.
+ *
+ * Reading the checkout beats scanning the harness's own chatter for
+ * filenames: `git status` is the ground truth about what is on disk, it
+ * needs no per-harness output format, and it cannot be fooled by a model
+ * that says it wrote a file it never wrote.
+ */
+function watchRepoFiles(taskId, cwd) {
+  const seen = new Set()
+  const tick = async () => {
+    try {
+      const out = await git(['status', '--porcelain'], cwd)
+      for (const line of out.split('\n')) {
+        const file = line.slice(3).trim()
+        if (!file || seen.has(file)) continue
+        seen.add(file)
+        note(taskId, `Wrote ${file}`, { phase: 'code', path: file })
+      }
+    } catch {
+      /* the checkout may be mid-write; try again on the next tick */
+    }
+  }
+  const timer = setInterval(tick, 5000)
+  return () => {
+    clearInterval(timer)
+    return tick()
+  }
+}
+
+/* ────────────────────────────────────────────────────────────────────────
+ * Media jobs.
+ *
+ * The worker's contribution here is a machine with ffmpeg on it, and
+ * deliberately nothing else. It does not read the job description, does not
+ * ask a model what to do, and does not build a command: the platform
+ * compiled the argv from a validated recipe (lib/media-recipe.ts) and sent
+ * it, and this substitutes two path placeholders and runs the binary.
+ *
+ * One implementation of "what does this job mean" instead of two that drift
+ * until the same job renders differently depending on who claimed it. And no
+ * shell anywhere — `execFile`, an argv array, a binary named ffmpeg.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** 512 MB. A source larger than this is a job for a rendering service, not
+ *  for somebody's laptop, and streaming it to disk before finding that out
+ *  is how a worker fills a home partition. */
+const MEDIA_MAX_SOURCE_BYTES = 512 * 1024 * 1024
+/** The callback carries artifacts inline as base64. Past this the render has
+ *  to go to blob storage, and saying so beats a 413 from a POST. */
+const MEDIA_MAX_INLINE_BYTES = 2 * 1024 * 1024
+
+/** Is ffmpeg actually on this machine? Reported so a media job is matched to
+ *  a worker that can do it rather than to one that merely claims 'video'. */
+async function detectFfmpeg() {
+  try {
+    const { stdout } = await execFileAsync('ffmpeg', ['-version'], { timeout: 10_000 })
+    const line = String(stdout).split('\n')[0].trim()
+    return { present: true, version: line.slice(0, 120) }
+  } catch {
+    return { present: false, version: null }
+  }
+}
+
+/** Stream the source to disk, refusing anything oversized or non-https. */
+async function fetchSource(url, dest, taskId) {
+  const parsed = new URL(url)
+  if (parsed.protocol !== 'https:') throw new Error(`source must be https, got ${parsed.protocol}`)
+  note(taskId, `Downloading ${parsed.hostname}${parsed.pathname}`, { phase: 'plan' })
+  const res = await fetch(url, { redirect: 'follow' })
+  if (!res.ok) throw new Error(`source fetch failed: HTTP ${res.status}`)
+  const declared = Number(res.headers.get('content-length') ?? '0')
+  if (declared > MEDIA_MAX_SOURCE_BYTES) {
+    throw new Error(`source is ${(declared / 1048576).toFixed(0)}MB, over the ${MEDIA_MAX_SOURCE_BYTES / 1048576}MB limit`)
+  }
+  const buf = Buffer.from(await res.arrayBuffer())
+  // Checked again after the fact: content-length is a claim, not a promise,
+  // and a chunked response does not send one at all.
+  if (buf.length > MEDIA_MAX_SOURCE_BYTES) {
+    throw new Error(`source turned out to be ${(buf.length / 1048576).toFixed(0)}MB, over the limit`)
+  }
+  await fs.writeFile(dest, buf)
+  note(taskId, `Downloaded ${(buf.length / 1048576).toFixed(1)}MB`, { phase: 'plan', level: 'good' })
+  return buf.length
+}
+
+async function runMediaTask(task, media) {
+  const dir = path.join(os.tmpdir(), `handsel-media-${task.task_id}`)
+  await fs.mkdir(dir, { recursive: true })
+  const inPath = path.join(dir, 'source')
+  const outPath = path.join(dir, 'render.mp4')
+  try {
+    await fetchSource(media.source_url, inPath, task.task_id)
+
+    const args = media.args.map((a) =>
+      a === media.input_token ? inPath : a === media.output_token ? outPath : a,
+    )
+    // Belt and braces on a value that arrived over the network and is going
+    // to a process: the platform built it, but "the other side checks it" is
+    // not a property this side gets to assume.
+    for (const a of args) {
+      if (/[;&|`$\n><]/.test(a)) throw new Error(`refusing an ffmpeg argument containing shell metacharacters: ${a.slice(0, 40)}`)
+    }
+    note(task.task_id, `ffmpeg ${args.filter((a) => a !== inPath && a !== outPath).join(' ')}`, { phase: 'code' })
+
+    const started = Date.now()
+    await execFileAsync('ffmpeg', args, { timeout: HARNESS_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 })
+    const bytes = await fs.readFile(outPath)
+    note(
+      task.task_id,
+      `Rendered ${(bytes.length / 1048576).toFixed(2)}MB in ${((Date.now() - started) / 1000).toFixed(1)}s`,
+      { phase: 'review', level: 'good', path: 'render.mp4' },
+    )
+
+    if (bytes.length > MEDIA_MAX_INLINE_BYTES) {
+      throw new Error(
+        `render is ${(bytes.length / 1048576).toFixed(1)}MB, over the ${MEDIA_MAX_INLINE_BYTES / 1048576}MB inline limit — ` +
+          'ask a smaller output size, a shorter trim, or enable blob storage on the deployment',
+      )
+    }
+    return {
+      output: `Rendered with ffmpeg from the job's media recipe. ${bytes.length} bytes.`,
+      artifacts: [{ name: 'render.mp4', mime: 'video/mp4', data_base64: bytes.toString('base64') }],
+    }
+  } finally {
+    // The source can be hundreds of megabytes. Leaving it behind fills a
+    // disk one job at a time, and the failure shows up on an unrelated run.
+    await fs.rm(dir, { recursive: true, force: true }).catch(() => {})
+  }
+}
+
+async function runRepoTask(task, repo) {
+  const rel = clonePathFor(task.task_id)
+  const dest = path.resolve(WORKDIR, rel)
+  await fs.rm(dest, { recursive: true, force: true }).catch(() => {})
+  await fs.mkdir(path.dirname(dest), { recursive: true })
+
+  console.log(`\n[worker] cloning ${repo.fullName}${repo.baseBranch ? `@${repo.baseBranch}` : ' (default branch)'} → ${rel}`)
+  note(task.task_id, `Cloning ${repo.fullName}`, { phase: 'plan' })
+  await git(
+    [
+      'clone',
+      '--depth',
+      '1',
+      '--single-branch',
+      ...(repo.baseBranch ? ['--branch', repo.baseBranch] : []),
+      '--',
+      `https://github.com/${repo.fullName}.git`,
+      dest,
+    ],
+    WORKDIR,
+  )
+  const baseSha = (await git(['rev-parse', 'HEAD'], dest)).trim()
+  const branch = (await git(['rev-parse', '--abbrev-ref', 'HEAD'], dest)).trim()
+
+  const brief = [
+    task.task.trim(),
+    '',
+    '---',
+    '',
+    'HOW THIS RUN IS SET UP:',
+    `${repo.fullName} is already cloned for you at \`${rel}\` on branch \`${branch}\`, and that is your working directory.`,
+    'Make the change there, in the files. Do not print a diff and do not write a summary file —',
+    'the diff is taken from the checkout with git once you are done, so what is on disk IS the deliverable.',
+  ].join('\n')
+
+  note(task.task_id, `Checked out ${branch} at ${baseSha.slice(0, 7)}`, { phase: 'plan', level: 'good' })
+
+  const stopWatching = watchRepoFiles(task.task_id, dest)
+  let stdout
+  try {
+    ;({ stdout } = await spawnHarness(brief, dest, task.task_id))
+  } finally {
+    // Always drain the watcher, including on a throw: the last tick is the
+    // one that sees the files written just before the harness died, which is
+    // exactly what someone reading a failed run needs.
+    await stopWatching()
+  }
+
+  // Stage first: a diff that silently omits CREATED files is the most common
+  // way a repo-job submission fails review, and it reads as the worker having
+  // forgotten to write them.
+  await git(['add', '-A'], dest)
+  // Against the recorded base rather than HEAD, so this works whether or not
+  // the harness committed its own work — several of them do.
+  const diff = await git(['diff', '--cached', '--no-color', '--no-ext-diff', baseSha], dest)
+
+  const hasPatch = diff
+    .trim()
+    .split('\n')
+    .some((l) => l.startsWith('diff --git ') || l.startsWith('--- '))
+  if (!hasPatch) {
+    throw new Error(
+      `${HARNESS.label} changed nothing in ${repo.fullName} — no diff to submit. ` +
+        'Submitting a description of work that did not happen is worse than failing the job.',
+    )
+  }
+
+  const summary = extractHarnessText(stdout).trim().slice(0, 1500)
+  console.log(`\n[worker] diff: ${diff.split('\n').length} lines from ${rel}`)
+  note(task.task_id, `Diff ready — ${diff.split('\n').length} lines`, { phase: 'review', level: 'good' })
+  return [summary, summary ? '' : null, '```diff', diff.trimEnd(), '```'].filter((l) => l !== null).join('\n')
+}
+
+/**
+ * Run one task through the harness.
+ *
+ * stdout and stderr are streamed to the console rather than buffered
+ * silently: this is somebody's own machine, the run takes minutes, and a
+ * progress-free wait is indistinguishable from a hang.
+ */
+/**
+ * Run the harness once and hand back what it said.
+ *
+ * Split out of runHarnessTask so a repo job can point it at a scratch
+ * checkout instead of the worker's own --workdir: with --concurrency two jobs
+ * share a workdir, and one clone between them would put each job's changes in
+ * the other's submission.
+ */
+async function spawnHarness(brief, cwd, taskId = null) {
+  const argv = HARNESS.argv({ brief, workdir: cwd, model: flag('harness-model') ?? null })
+  note(taskId, `${HARNESS.label} started`, { phase: 'code' })
+  const { out, code, errTail } = await new Promise((resolve, reject) => {
+    const child = spawn(HARNESS.bin, argv, {
+      // The CALLER's directory, not WORKDIR: a repo job runs the harness
+      // inside its own scratch checkout, and using WORKDIR here silently put
+      // every edit one level up, where `git diff` in the checkout could not
+      // see it. Found by running it, not by a test.
+      cwd,
+      stdio: [HARNESS.briefOnStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'],
+      env: process.env,
+    })
+    let out = ''
+    // Kept so a failure explains itself in the TASK RECORD, not only on a
+    // console nobody is watching. "produced neither a file nor any output"
+    // is a symptom; the harness's own last words are the cause.
+    let errTail = ''
+    const timer = setTimeout(() => {
+      child.kill()
+      reject(new Error(`${HARNESS.label} exceeded --harness-timeout (${Math.round(HARNESS_TIMEOUT_MS / 1000)}s)`))
+    }, HARNESS_TIMEOUT_MS)
+    if (HARNESS.briefOnStdin) child.stdin.end(brief)
+    // The same bytes go to two places now: the owner's console, as before,
+    // and the run log, so somebody watching from the dashboard sees the same
+    // progress the person sitting at the machine does. Line-buffered, since
+    // a chunk boundary is not a log entry.
+    let pending = ''
+    child.stdout.on('data', (d) => {
+      out += d
+      process.stdout.write(d)
+      pending += d
+      const lines = pending.split('\n')
+      pending = lines.pop() ?? ''
+      for (const line of lines) if (line.trim()) note(taskId, line, { phase: 'code' })
+    })
+    child.stderr.on('data', (d) => {
+      errTail = (errTail + d).slice(-2000)
+      process.stderr.write(d)
+    })
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      reject(new Error(`could not run ${HARNESS.bin}: ${e.message}`))
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      // A non-zero exit is not automatically a failed task: several of these
+      // exit non-zero on a turn limit having already written a usable
+      // deliverable. The file decides; the code only colours the log.
+      if (code !== 0) console.log(`\n[worker] ${HARNESS.label} exited ${code}`)
+      note(taskId, `${HARNESS.label} exited ${code}`, { phase: 'code', level: code === 0 ? 'good' : 'bad' })
+      resolve({ out, code, errTail })
+    })
+  })
+  return { stdout: out, code, errTail }
+}
+
+async function runHarnessTask(task) {
+  const rel = deliverablePathFor(task.task_id)
+  const abs = path.resolve(WORKDIR, rel)
+  await fs.mkdir(path.dirname(abs), { recursive: true })
+  // Never inherit a previous run's file: an interrupted task that left one
+  // behind would otherwise be submitted as this task's work.
+  await fs.unlink(abs).catch(() => {})
+
+  const brief = harnessBrief(`Working directory: ${WORKDIR}\n\nTask:\n${task.task}`, rel)
+  const { stdout, code, errTail } = await spawnHarness(brief, WORKDIR, task.task_id)
+
+  let file = null
+  try {
+    file = await fs.readFile(abs, 'utf8')
+  } catch {
+    /* the harness wrote nothing — fall back to what it said */
+  }
+  if (file && file.trim()) {
+    console.log(`\n[worker] deliverable from ${rel} (${file.trim().length} chars)`)
+    return file.trim()
+  }
+  const salvaged = extractHarnessText(stdout).trim()
+  if (!salvaged) {
+    throw new Error(
+      `${HARNESS.label} exited ${code} and produced neither ${rel} nor any output` +
+        (errTail.trim() ? `: ${errTail.trim().slice(-600)}` : ''),
+    )
+  }
+  console.log(`\n[worker] ${HARNESS.label} wrote no ${rel} — submitting its output instead`)
+  return salvaged
+}
+
+/** Fallback only. These event streams are unversioned, so this is tolerant
+ *  by design: approximately right beats empty, because an empty submission
+ *  fails grading with no clue why. */
+function extractHarnessText(stdout) {
+  const out = []
+  const TEXT_KEYS = new Set(['text', 'result', 'content', 'message', 'response', 'output'])
+  const walk = (node, depth) => {
+    if (depth > 6 || node === null || node === undefined) return
+    if (typeof node === 'string') {
+      const t = node.trim()
+      if (t) out.push(t)
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item, depth + 1)
+      return
+    }
+    if (typeof node !== 'object') return
+    const type = typeof node.type === 'string' ? node.type : ''
+    if (type && /tool|error|usage|thinking|reasoning/i.test(type)) return
+    for (const key of Object.keys(node)) if (TEXT_KEYS.has(key)) walk(node[key], depth + 1)
+  }
+  for (const line of stdout.split('\n')) {
+    const t = line.trim()
+    if (!t.startsWith('{')) continue
+    try {
+      walk(JSON.parse(t), 0)
+    } catch {
+      /* truncated or not an event — skip the line, keep the run */
+    }
+  }
+  const joined = out.join('\n').trim()
+  return joined || stdout.trim()
+}
+
+/* ── Agent mode ───────────────────────────────────────────────────────────
+ * With --workdir the worker stops being a single prompt and becomes a loop:
+ * the model emits action tags, we execute them against the directory, feed
+ * the results back, and repeat until it says <done>. That is the difference
+ * between an agent that describes a fix and one that makes it.
+ *
+ * The grammar is a text protocol rather than OpenAI function-calling
+ * because this worker targets ANY OpenAI-compatible endpoint — Ollama, LM
+ * Studio, llama.cpp, vLLM, Groq — and tool-calling support across those is
+ * inconsistent and differently shaped. Tags work everywhere, including on
+ * models with no tool support at all, which is the population this worker
+ * exists to sell the labor of.
+ *
+ * Mirrored from lib/worker-agent-protocol.ts, which holds the same rules as
+ * pure functions with tests (tests/worker-agent-protocol.test.ts). This file
+ * is dependency-free and standalone by design, so it cannot import them —
+ * if you change one, change both. */
+const MAX_AGENT_STEPS = 24
+const MAX_TOOL_OUTPUT = 8000
+
+/** Resolve `candidate` inside WORKDIR, or null if it escapes. THE sandbox:
+ *  tasks can arrive from strangers, so this decides what a paying outsider's
+ *  model may touch on the owner's machine. Absolute paths are refused rather
+ *  than rebased — rebasing turns a request for /etc/passwd into a read of
+ *  <workdir>/etc/passwd, which succeeds quietly and hides the attempt. */
+function confinePath(candidate) {
+  if (!candidate || candidate.includes('\0')) return null
+  if (candidate.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(candidate)) return null
+  const resolved = path.resolve(WORKDIR, candidate)
+  const root = WORKDIR.endsWith(path.sep) ? WORKDIR : WORKDIR + path.sep
+  if (resolved !== WORKDIR && !resolved.startsWith(root)) return null
+  return resolved
+}
+
+const ACTION_TAG = /<(read|write|list|bash|done)((?:\s+[a-z]+="[^"]*")*)\s*(?:\/>|>([\s\S]*?)<\/\1>)/g
+const attrOf = (raw, name) => (raw.match(new RegExp(`${name}="([^"]*)"`)) ?? [, ''])[1]
+
+function parseActions(reply) {
+  const out = []
+  ACTION_TAG.lastIndex = 0
+  for (const m of reply.matchAll(ACTION_TAG)) {
+    const [, kind, rawAttrs, body = ''] = m
+    if (kind === 'read') out.push({ kind, path: attrOf(rawAttrs, 'path') })
+    else if (kind === 'list') out.push({ kind, path: attrOf(rawAttrs, 'path') || '.' })
+    else if (kind === 'write') out.push({ kind, path: attrOf(rawAttrs, 'path'), content: body })
+    else if (kind === 'bash') out.push({ kind, command: body.trim() })
+    else if (kind === 'done') out.push({ kind, summary: body.trim() })
+  }
+  return out.filter((a) => (a.path === undefined ? true : a.path !== ''))
+}
+
+const clamp = (t) => (t.length <= MAX_TOOL_OUTPUT ? t : `${t.slice(0, MAX_TOOL_OUTPUT)}\n…[truncated ${t.length - MAX_TOOL_OUTPUT} more characters]`)
+
+/** Run one action and return what the model should see next. Every failure
+ *  becomes TEXT, never a throw: a refused path or a failing command is
+ *  information the agent should react to, not a reason to fail the task. */
+async function runAction(a) {
+  if (a.kind === 'done') return null
+  if (a.kind === 'bash' && !ALLOW_BASH) return 'ERROR: running commands is disabled (worker started without --allow-bash).'
+  if (a.kind === 'bash') {
+    try {
+      const { stdout, stderr } = await execFileAsync('/bin/sh', ['-c', a.command], {
+        cwd: WORKDIR,
+        timeout: 120_000,
+        maxBuffer: 4 * 1024 * 1024,
+      })
+      return clamp(`$ ${a.command}\n${stdout}${stderr ? `\n[stderr]\n${stderr}` : ''}` || '(no output)')
+    } catch (e) {
+      // A non-zero exit is a normal result for a test run — hand back the
+      // output so the agent can fix what failed.
+      return clamp(`$ ${a.command}\n[exit ${e.code ?? '?'}]\n${e.stdout ?? ''}${e.stderr ?? ''}` || String(e))
+    }
+  }
+
+  const target = confinePath(a.path)
+  if (!target) return `ERROR: "${a.path}" is outside the working directory. All paths are relative to it.`
+  try {
+    if (a.kind === 'list') {
+      const entries = await fs.readdir(target, { withFileTypes: true })
+      return clamp(entries.map((e) => (e.isDirectory() ? `${e.name}/` : e.name)).join('\n') || '(empty)')
+    }
+    if (a.kind === 'read') return clamp(await fs.readFile(target, 'utf8'))
+    if (a.kind === 'write') {
+      await fs.mkdir(path.dirname(target), { recursive: true })
+      await fs.writeFile(target, a.content, 'utf8')
+      return `wrote ${a.path} (${a.content.length} chars)`
+    }
+  } catch (e) {
+    return `ERROR: ${e instanceof Error ? e.message : String(e)}`
+  }
+  return null
+}
+
+function agentSystemPrompt() {
+  return [
+    'You are an autonomous worker agent on the Handsel labor market, working on real source code.',
+    'You have a working directory. All paths are relative to it. You cannot read or write outside it.',
+    '',
+    'Act by emitting these tags. You may emit several per reply; results come back before your next turn.',
+    '  <list path="src"/>            — list a directory',
+    '  <read path="src/a.ts"/>       — read a file',
+    '  <write path="src/a.ts">FULL NEW CONTENTS</write>',
+    ...(ALLOW_BASH ? ['  <bash>npm test</bash>            — run a command in the working directory'] : []),
+    '  <done>what you changed and why</done>',
+    '',
+    'Rules:',
+    '- Read before you write. Never write a file you have not read, unless you are creating it.',
+    '- <write> replaces the ENTIRE file. Emit the complete new contents, not a diff or a fragment.',
+    ...(ALLOW_BASH ? [] : ['- Running commands is disabled for this task. Do not emit <bash>.']),
+    '- When the work is finished, emit <done> with a short summary. That summary is your submission.',
+    `- You have at most ${MAX_AGENT_STEPS} turns. Spend them on the task, not on exploring.`,
+  ].join('\n')
+}
+
+const SYSTEM_PROMPT =
+  'You are an autonomous worker agent on the Handsel labor market. ' +
+  'Complete the task exactly as specified. If the task requires code in a ' +
+  'fenced code block, provide the complete, runnable code. Be factual and concise.'
+
+/**
+ * Both model paths STREAM the response. This matters for slow/reasoning
+ * models (deepseek-r1 etc.): with stream:false the server sends nothing
+ * until generation finishes, and Node's fetch kills a connection whose
+ * headers take >5 minutes — the run dies as "fetch failed" right before
+ * the model would have answered. Streaming delivers bytes continuously,
+ * so no timeout trips no matter how long the model thinks.
+ */
+async function readStreamLines(res, onLine) {
+  const reader = res.body.getReader()
+  const decoder = new TextDecoder()
+  let buf = ''
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    buf += decoder.decode(value, { stream: true })
+    let idx
+    while ((idx = buf.indexOf('\n')) >= 0) {
+      const line = buf.slice(0, idx).trim()
+      buf = buf.slice(idx + 1)
+      if (line) onLine(line)
+    }
+  }
+  if (buf.trim()) onLine(buf.trim())
+}
+
+function progressTicker() {
+  let chunks = 0
+  return () => {
+    chunks += 1
+    if (chunks % 50 === 0) process.stdout.write('▪') // heartbeat: the model is generating
+  }
+}
+
+/** Final cleanup for reasoning models: drop closed <think> blocks (older
+ *  Ollama embeds them in content); if content is empty but the model
+ *  streamed a separate thinking channel, fall back to it — a messy answer
+ *  beats an empty submission. */
+function finishOutput(content, thinking) {
+  const cleaned = content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+  if (cleaned) return cleaned
+  if (content.trim()) return content.trim()
+  return thinking.trim()
+}
+
+/** One model turn. `messages` is the full conversation, so the agent loop
+ *  can carry tool results forward; the single-shot path passes the same two
+ *  messages it always did. */
+async function askModel(messages) {
+  const tick = progressTicker()
+  let content = ''
+  let thinking = ''
+
+  if (OPENAI_BASE) {
+    const res = await fetch(`${OPENAI_BASE.replace(/\/+$/, '')}/chat/completions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${API_KEY}` },
+      body: JSON.stringify({
+        model: MODEL,
+        stream: true,
+        messages,
+      }),
+    })
+    if (!res.ok) throw new Error(`local model responded ${res.status}: ${(await res.text()).slice(0, 300)}`)
+    await readStreamLines(res, (line) => {
+      if (!line.startsWith('data:')) return
+      const data = line.slice(5).trim()
+      if (data === '[DONE]') return
+      try {
+        const delta = JSON.parse(data).choices?.[0]?.delta
+        if (delta?.content) content += delta.content
+        if (delta?.reasoning_content) thinking += delta.reasoning_content
+        if (delta?.content || delta?.reasoning_content) tick()
+      } catch {
+        /* partial/keepalive line */
+      }
+    })
+    return finishOutput(content, thinking)
+  }
+
+  const res = await fetch(`${OLLAMA_BASE}/api/chat`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: MODEL,
+      stream: true,
+      messages,
+    }),
+  })
+  if (!res.ok) throw new Error(`Ollama responded ${res.status}: ${(await res.text()).slice(0, 300)} — is Ollama running? (ollama serve / ollama pull ${MODEL})`)
+  await readStreamLines(res, (line) => {
+    try {
+      const chunk = JSON.parse(line)
+      // Reasoning models stream a separate "thinking" channel. Collect both:
+      // the answer comes from content, but if a model pours everything into
+      // thinking and leaves content empty, finishOutput falls back to it.
+      if (chunk.message?.content) content += chunk.message.content
+      if (chunk.message?.thinking) thinking += chunk.message.thinking
+      if (chunk.message?.content || chunk.message?.thinking) tick()
+    } catch {
+      /* partial line */
+    }
+  })
+  return finishOutput(content, thinking)
+}
+
+async function platformPost(path, payload) {
+  const res = await fetch(`${PLATFORM}${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Runtime-Secret': SECRET },
+    body: JSON.stringify(payload),
+  })
+  if (!res.ok) throw new Error(`${path} responded ${res.status}: ${(await res.text()).slice(0, 300)}`)
+  return res.json()
+}
+
+function event(taskId, type, success, detail = {}) {
+  return {
+    agent_id: AGENT_ID,
+    task_id: taskId,
+    event_type: type,
+    success,
+    execution_time: 0,
+    token_cost: 0,
+    quality_score: null,
+    detail,
+  }
+}
+
+/** Single-shot: the behaviour every install had before --workdir. */
+const askLocalModel = (task) =>
+  askModel([
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: task },
+  ])
+
+/**
+ * Agent mode. Loop the model against real files until it says <done>, or
+ * until the step budget runs out.
+ *
+ * What gets submitted is the <done> summary — the work itself is the files
+ * the agent changed on disk, which is the point: with --allow-bash the
+ * natural last step is `git diff`, and the summary describes a change a
+ * human can actually inspect. If the budget runs out first we submit the
+ * last thing the model said rather than nothing, because a partial answer
+ * is gradeable and an empty submission is a forfeited bounty.
+ */
+async function runAgentTask(task) {
+  const messages = [
+    { role: 'system', content: agentSystemPrompt() },
+    { role: 'user', content: `Working directory: ${WORKDIR}\n\nTask:\n${task}` },
+  ]
+  let last = ''
+
+  for (let step = 0; step < MAX_AGENT_STEPS; step += 1) {
+    const reply = await askModel(messages)
+    last = reply
+    messages.push({ role: 'assistant', content: reply })
+
+    const actions = parseActions(reply)
+    const done = actions.find((a) => a.kind === 'done')
+    if (done) {
+      console.log(`\n[worker] done in ${step + 1} step(s)`)
+      return done.summary || reply
+    }
+    if (actions.length === 0) {
+      // No tags at all. Nudge once rather than looping on prose — a model
+      // that cannot speak the protocol should fail fast and submit what it
+      // said, not burn 24 turns saying it again.
+      messages.push({
+        role: 'user',
+        content: 'You emitted no action tags. Emit <list>, <read>, <write>' + (ALLOW_BASH ? ', <bash>' : '') + ' or <done>.',
+      })
+      continue
+    }
+
+    const results = []
+    for (const a of actions) {
+      const out = await runAction(a)
+      if (out !== null) {
+        const label = a.kind === 'bash' ? a.command : a.path
+        results.push(`<result for="${a.kind}" path="${label}">\n${out}\n</result>`)
+        process.stdout.write(a.kind === 'write' ? 'W' : a.kind === 'bash' ? '$' : 'r')
+      }
+    }
+    messages.push({ role: 'user', content: results.join('\n\n') })
+  }
+
+  console.log(`\n[worker] step budget (${MAX_AGENT_STEPS}) exhausted — submitting the last reply`)
+  return last
+}
+
+/**
+ * Produce the deliverable once, for a given brief.
+ *
+ * Split out of runOne so a failed grade can be answered: the platform hands
+ * back the grader's reasons and the same worker runs again against the same
+ * job and the same escrow (lib/grading-retry.ts). Before this, a failing
+ * assertion replaced a worker that was one edit from passing with a stranger
+ * starting from nothing.
+ */
+async function produceOnce(task, brief) {
+  const briefed = brief === task.task ? task : { ...task, task: brief }
+  if (task.media) {
+    if (!FFMPEG.present) throw new Error('this job needs ffmpeg and it is not on this machine')
+    const rendered = await runMediaTask(briefed, task.media)
+    return { output: rendered.output, artifacts: rendered.artifacts }
+  }
+  const repo = HARNESS && WORKDIR ? repoOf(task) : null
+  const output = repo
+    ? await runRepoTask(briefed, repo)
+    : HARNESS
+      ? await runHarnessTask(briefed)
+      : WORKDIR
+        ? await runAgentTask(brief)
+        : await askLocalModel(brief)
+  return { output, artifacts: [] }
+}
+
+/**
+ * A stop the worker owns, so a platform that never stops saying 'retry'
+ * cannot spin this machine forever.
+ *
+ * Strictly above MAX_GRADING_ATTEMPTS (5), and it has to be. This was also 5
+ * when the platform cap was 3; raising the platform to 5 without moving this
+ * would have made the two coincide, and a backstop that binds at the same
+ * point as the thing it backs is not a backstop — it would have silently cut
+ * off the last attempt the platform was willing to grade.
+ */
+const WORKER_MAX_ATTEMPTS = 8
+
+async function runOne(task) {
+  const startedAt = Date.now()
+  console.log(`\n[worker] task ${task.task_id}:`)
+  console.log(`  ${task.task.split('\n')[0].slice(0, 100)}…`)
+  beginRun(task.task_id)
+  note(task.task_id, `Claimed: ${task.task.split('\n')[0].slice(0, 120)}`, { phase: 'plan' })
+
+  let output = ''
+  let artifacts = []
+  let success = true
+  let error
+  try {
+    // A media job is decided before anything else looks at the brief: the
+    // platform already compiled the recipe, so there is nothing for a model
+    // to interpret and handing it one would only invite it to improvise.
+    const produced = await produceOnce(task, task.task)
+    output = produced.output
+    artifacts = produced.artifacts
+    if (!output.trim()) {
+      success = false
+      error = 'local model returned empty output'
+    }
+  } catch (e) {
+    success = false
+    error = e instanceof Error ? e.message : String(e)
+  }
+
+  process.stdout.write('\n')
+  const executionTime = Math.round((Date.now() - startedAt) / 1000)
+  note(
+    task.task_id,
+    success ? `Submitted after ${executionTime}s` : `Failed: ${String(error).slice(0, 200)}`,
+    { phase: 'review', level: success ? 'good' : 'bad' },
+  )
+  // Marked finished BEFORE the callback, so the very next poll carries the
+  // final report even if the callback itself is what fails. A run that ends
+  // without one sits on the console as "Running" until it goes stale, which
+  // is a worse answer than "failed".
+  endRun(task.task_id, success)
+  const events = [
+    event(task.task_id, 'TASK_STARTED', true, { task: task.task.slice(0, 200) }),
+    {
+      ...event(task.task_id, success ? 'TASK_COMPLETED' : 'TASK_FAILED', success, {
+        runtime: 'local-worker',
+        model: MODEL,
+        ...(error ? { error: error.slice(0, 300) } : {}),
+      }),
+      execution_time: executionTime,
+    },
+  ]
+
+  /**
+   * Post the result, and answer the grader if it asks.
+   *
+   * `settled: 'retry'` means the grade failed but the job is still ours —
+   * same escrow, same acceptance criteria, attempts remaining. The response
+   * carries the grader's own words as a brief, and running again is strictly
+   * better for everyone than the old behaviour, which reposted the job to a
+   * stranger and handed us the reasons for a job we no longer had.
+   *
+   * The lifecycle events go on the FINAL post only. TASK_COMPLETED is a credit
+   * event; emitting one per attempt would count a single task three times.
+   */
+  const post = (payload, withEvents) =>
+    platformPost('/api/runtime/callback', {
+      task_id: task.task_id,
+      agent_id: AGENT_ID,
+      plan: '',
+      quality_score: null, // self-scoring is worthless here; independent graders decide
+      execution_time: executionTime,
+      token_cost: 0,
+      events: withEvents ? events : [],
+      ...payload,
+    })
+
+  /** `/api/runtime/callback` answers `{ status, grading }` — the verdict is
+   *  the INNER object. Reading the envelope instead silently never retries:
+   *  `settled` is undefined there, so the loop below simply does not run, and
+   *  a worker that was told to fix its work goes back to polling for new jobs
+   *  as if it had passed. Found by running it against a stub platform. */
+  const verdictOf = (r) => r?.grading ?? null
+
+  let verdict = verdictOf(await post(
+    {
+      success,
+      output: success ? output : `Local worker error: ${error}`,
+      // The rendered file itself. Grading reads THESE BYTES (lib/mp4-probe.ts)
+      // rather than any claim made about them, which is the only version of a
+      // media job where "it rendered correctly" is somebody else's finding.
+      ...(artifacts.length > 0 ? { artifacts } : {}),
+    },
+    false,
+  ).catch((e) => {
+    console.error(`[worker] callback failed: ${e.message}`)
+    return null
+  }))
+
+  for (let attempt = 2; verdict?.settled === 'retry' && attempt <= WORKER_MAX_ATTEMPTS; attempt++) {
+    const cap = Number(verdict.maxAttempts) || WORKER_MAX_ATTEMPTS
+    console.log(`[worker] grading failed — answering the grader (attempt ${verdict.attempt ?? attempt} of ${cap})`)
+    note(task.task_id, `Grader rejected it; revising (attempt ${verdict.attempt ?? attempt}/${cap})`, {
+      phase: 'code',
+      level: 'warn',
+    })
+    // The requester may have spoken since the last attempt. Their notes are
+    // already inside `verdict.reason` (the platform composes the brief, so
+    // there is one copy of the rule that notes clarify and never re-scope);
+    // this only tells the person watching this console that it happened.
+    const requesterNotes = Number(verdict.requesterNotes) || 0
+    if (requesterNotes > 0) {
+      console.log(`[worker] the requester has sent ${requesterNotes} note${requesterNotes === 1 ? '' : 's'} on this job — included in the brief`)
+      note(task.task_id, `Requester notes in the brief: ${requesterNotes}`, { phase: 'code' })
+    }
+    // The platform's brief carries the criteria and the grader's words; the
+    // previous submission is appended here because this side already has it
+    // verbatim and shipping it back and forth would only risk a truncation.
+    const brief = `${verdict.reason}\n\n### Your previous submission\n\n${output}`
+    try {
+      const again = await produceOnce(task, brief)
+      output = again.output
+      artifacts = again.artifacts
+      success = Boolean(output.trim())
+      if (!success) error = 'local model returned empty output on the revision'
+    } catch (e) {
+      success = false
+      error = e instanceof Error ? e.message : String(e)
+    }
+    verdict = verdictOf(
+      await post(
+        { success, output: success ? output : `Local worker error: ${error}`, ...(artifacts.length > 0 ? { artifacts } : {}) },
+        false,
+      ).catch((e) => {
+        console.error(`[worker] callback failed: ${e.message}`)
+        return null
+      }),
+    )
+  }
+
+  // The lifecycle events, once, now that the attempt sequence is over. A
+  // dedicated events-only post: re-sending the output here would re-grade it
+  // and submit it on chain a second time.
+  await platformPost('/api/runtime/callback', {
+    task_id: task.task_id,
+    agent_id: AGENT_ID,
+    events_only: true,
+    events,
+  }).catch((e) => console.error(`[worker] event report failed: ${e.message}`))
+  console.log(success ? `[worker] done in ${executionTime}s — result submitted` : `[worker] FAILED: ${error}`)
+}
+
+/**
+ * A cold Ollama/LM Studio process can take a while to load a model into
+ * memory on its first request — sometimes minutes for a large model on a
+ * slow disk, or a few seconds just for the local server to finish starting
+ * up after install. Polling before the model is actually ready means the
+ * platform can hand this worker a real task while it's still loading,
+ * which fails immediately with a confusing runtime error. So: block here,
+ * retrying a trivial prompt with backoff, and only start polling once the
+ * model genuinely answers. Runs before a single task can ever be claimed.
+ */
+const WARMUP_MAX_ATTEMPTS = 8
+async function warmupModel() {
+  const label = OPENAI_BASE ? `OpenAI-compatible endpoint ${OPENAI_BASE}` : `Ollama ${OLLAMA_BASE}`
+  console.log(`[worker] warming up ${MODEL} via ${label} (first load can take a minute)…`)
+  for (let attempt = 1; attempt <= WARMUP_MAX_ATTEMPTS; attempt++) {
+    try {
+      await askLocalModel('Reply with one word: ready')
+      console.log('[worker] model is warm\n')
+      return
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      if (attempt === WARMUP_MAX_ATTEMPTS) {
+        console.error(`[worker] model never became ready after ${WARMUP_MAX_ATTEMPTS} attempts: ${msg}`)
+        console.error(OPENAI_BASE
+          ? '[worker] check --openai URL, --api-key, and --model are correct.'
+          : `[worker] is Ollama running? Try: ollama serve   /   ollama pull ${MODEL}`)
+        process.exit(1)
+      }
+      console.error(`[worker] still warming up (attempt ${attempt}/${WARMUP_MAX_ATTEMPTS}): ${msg}`)
+      await new Promise((r) => setTimeout(r, Math.min(3000 * attempt, 20000)))
+    }
+  }
+}
+
+console.log(`[worker] Handsel local worker`)
+console.log(`[worker] agent    ${AGENT_ID}`)
+console.log(`[worker] platform ${PLATFORM}`)
+await resolveHarnessAtStartup()
+// Only print the model line when that model is what actually runs the work.
+// A harness carries its own model and auth, and announcing an Ollama the
+// harness never calls is how someone spends an afternoon debugging Ollama.
+if (!HARNESS) {
+  console.log(`[worker] model    ${MODEL} via ${OPENAI_BASE ? `OpenAI-compatible ${OPENAI_BASE}` : `Ollama ${OLLAMA_BASE}`}`)
+}
+if (HARNESS) {
+  console.log(`[worker] harness  ${HARNESS.label} in ${WORKDIR}`)
+  console.log(
+    `[worker] NOTE: the harness runs with its approvals off — it can edit and run anything in that directory,\n` +
+      `[worker]       and tasks can come from strangers. Point it at a checkout you can throw away.`,
+  )
+} else if (WORKDIR) {
+  console.log(`[worker] workdir  ${WORKDIR}${ALLOW_BASH ? ' (commands allowed)' : ''} — built-in agent loop`)
+}
+
+// Before anything is claimed: a bond is staked at accept time, and a harness
+// that cannot run loses it on every job it takes.
+await preflightHarness()
+
+// The built-in loop is what a warm model is for; a harness brings its own.
+if (!HARNESS) await warmupModel()
+
+// Probed once at startup, not assumed from a flag: a worker that DECLARES
+// video and cannot render is matched to media jobs it will fail, and a
+// failed job costs the agent its own credit score.
+
+/* ── Office-session runs ────────────────────────────────────────────────
+ *
+ * A session run is a task an office scheduled on THIS machine, with a
+ * grant the owner wrote (lib/office-session.ts WorkspaceGrant), a brief the
+ * platform composed, and a checkpoint to resume from when a previous
+ * attempt died. It differs from a market task in four ways:
+ *
+ *   - it is watched: harness output is parsed into events that ride the
+ *     next poll (`session_runs`), so the owner's page shows the run live;
+ *   - it checkpoints: every CHECKPOINT_EVERY_MS the working tree's diff and
+ *     changed files are captured and reported, so a run that dies leaves
+ *     something to resume from;
+ *   - it can be stopped: the poll's `session_cancel` list kills the child;
+ *   - it can be paused: the poll's `session_pause` list SIGSTOPs the child
+ *     and its absence SIGCONTs it (see pauseSessionRuns);
+ *   - the grant is enforced by the harness flags (claude) and by the cwd
+ *     (everything else), and the platform re-checks the reported files
+ *     against the workdir regardless.
+ *
+ * The functions below are pure mirrors of lib/coding-harness.ts where they
+ * decide what runs (claudeSessionArgv) — pinned by tests/coding-harness.test.ts.
+ * ──────────────────────────────────────────────────────────────────────── */
+
+/** Mirror of lib/coding-harness.ts claudeSessionArgv — keep byte-for-byte in sync. */
+function claudeSessionArgv(i) {
+  const argv = ['--print', '--output-format', 'stream-json', '--verbose']
+  if (i.model) argv.push('--model', i.model)
+  if (i.resumeSessionId) argv.push('--resume', i.resumeSessionId)
+  argv.push('--permission-mode', i.grant.write ? 'acceptEdits' : 'plan')
+  const allowed = []
+  const disallowed = []
+  if (!i.grant.write) disallowed.push('Edit', 'Write', 'MultiEdit', 'NotebookEdit')
+  if (i.grant.shell) allowed.push('Bash')
+  else disallowed.push('Bash')
+  if (!i.grant.network) disallowed.push('WebFetch', 'WebSearch')
+  if (allowed.length) argv.push('--allowedTools', allowed.join(','))
+  if (disallowed.length) argv.push('--disallowedTools', disallowed.join(','))
+  return argv
+}
+
+/**
+ * Mirror of lib/coding-harness.ts `harnessSessionArgv` — the grant on the
+ * other harnesses' own permission knobs (codex --sandbox, gemini
+ * --approval-mode, opencode --agent). Null means "this harness has no such
+ * knob": the cwd is the whole grant, and the platform records it that way.
+ */
+function harnessSessionArgv(i) {
+  const model = i.model ? ['--model', i.model] : []
+  switch (i.harnessId) {
+    case 'codex':
+      return ['exec', ...model, '--cd', i.workdir, '--sandbox', i.grant.write ? 'workspace-write' : 'read-only', '--skip-git-repo-check', i.brief]
+    case 'gemini':
+      return [...model, '--approval-mode', i.grant.shell ? 'yolo' : i.grant.write ? 'auto_edit' : 'default', '--prompt', i.brief]
+    case 'opencode':
+      return ['run', ...model, '--dir', i.workdir, ...(i.grant.write ? ['--auto'] : ['--agent', 'plan']), i.brief]
+    default:
+      return null
+  }
+}
+
+const CHECKPOINT_EVERY_MS = 60_000
+const CHECKPOINT_PATCH_MAX = 200_000
+const VERIFY_TIMEOUT_MS = 10 * 60_000
+const SECRET_RE = [
+  /sk-ant-[A-Za-z0-9_-]{20,}/g,
+  /sk-[A-Za-z0-9]{20,}/g,
+  /gh[pousr]_[A-Za-z0-9]{30,}/g,
+  /AKIA[0-9A-Z]{16}/g,
+  /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----/g,
+  /\b0x[a-fA-F0-9]{64}\b/g,
+]
+function redact(text) {
+  let out = String(text)
+  for (const re of SECRET_RE) out = out.replace(re, '[redacted]')
+  return out
+}
+
+/** runId → live run bookkeeping; drained into each poll. */
+const sessionRuns = new Map()
+
+function sessionNote(run, kind, text, path = null) {
+  try {
+    if (!text) return
+    if (run.events.length > 400) run.events.splice(0, run.events.length - 400)
+    run.events.push({ at: Date.now(), kind, text: redact(text).slice(0, 400), path })
+    if (kind === 'progress') run.lastProgress = String(text).slice(0, 300)
+  } catch {
+    /* telemetry never breaks a run */
+  }
+}
+
+/** One stream-json line → events (tolerant mirror of parseClaudeStreamLine). */
+function claudeLineEvents(run, line) {
+  const t = line.trim()
+  if (!t) return
+  if (!t.startsWith('{')) return sessionNote(run, 'stdout', t)
+  let obj
+  try {
+    obj = JSON.parse(t)
+  } catch {
+    return sessionNote(run, 'stdout', t)
+  }
+  if (obj.type === 'system') {
+    if (typeof obj.session_id === 'string') run.harnessSessionId = obj.session_id
+    return sessionNote(run, 'started', `claude session ${obj.session_id ?? '?'}`)
+  }
+  if (obj.type === 'assistant' || obj.type === 'user') {
+    const content = Array.isArray(obj.message?.content) ? obj.message.content : []
+    for (const b of content) {
+      if (b.type === 'text' && typeof b.text === 'string' && b.text.trim()) sessionNote(run, 'progress', b.text.trim())
+      else if (b.type === 'tool_use') {
+        const input = b.input ?? {}
+        const path = [input.file_path, input.path, input.notebook_path].find((v) => typeof v === 'string' && v.trim()) ?? null
+        const isEdit = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(b.name)
+        if (typeof input.command === 'string') run.shellUsed = true
+        sessionNote(run, isEdit && path ? 'file' : 'tool', b.name === 'Bash' && typeof input.command === 'string' ? `$ ${input.command.slice(0, 200)}` : path ? `${b.name} ${path}` : String(b.name), path)
+        // An edit is worth a checkpoint by itself: a run killed between its
+        // first edit and the minute ticker would otherwise leave nothing to
+        // resume from. Rate-limited so a burst of edits is one capture.
+        if (isEdit && Date.now() - (run.lastCheckpointAt ?? 0) > 10_000) {
+          run.lastCheckpointAt = Date.now()
+          setTimeout(() => captureCheckpoint(run).catch(() => {}), 1500)
+        }
+      } else if (b.type === 'tool_result' && b.is_error === true && typeof b.content === 'string') sessionNote(run, 'error', b.content)
+    }
+    return
+  }
+  if (obj.type === 'result') {
+    if (typeof obj.total_cost_usd === 'number') run.costUsd = obj.total_cost_usd
+    const u = obj.usage ?? {}
+    if (typeof u.input_tokens === 'number' || typeof u.output_tokens === 'number') run.tokensUsed = Number(u.input_tokens ?? 0) + Number(u.output_tokens ?? 0)
+    if (typeof obj.session_id === 'string') run.harnessSessionId = obj.session_id
+    if (typeof obj.result === 'string') run.resultText = obj.result.slice(0, 20_000)
+    sessionNote(run, 'cost', typeof obj.total_cost_usd === 'number' ? `cost $${obj.total_cost_usd.toFixed(4)}` : 'run finished')
+  }
+}
+
+async function isGitRepo(cwd) {
+  try {
+    await git(['rev-parse', '--is-inside-work-tree'], cwd)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Changed + deleted files relative to the index/HEAD, and a bounded diff including untracked files. */
+async function workspaceState(cwd, repo) {
+  if (!repo) return { changedFiles: [], deletedFiles: [], diff: null, head: null }
+  const status = await git(['status', '--porcelain', '--untracked-files=all'], cwd).catch(() => '')
+  const changedFiles = []
+  const deletedFiles = []
+  const untracked = []
+  for (const line of status.split('\n')) {
+    if (!line.trim()) continue
+    const code = line.slice(0, 2)
+    const file = line.slice(3).trim().replace(/^"|"$/g, '')
+    if (code.includes('D')) deletedFiles.push(file)
+    else changedFiles.push(file)
+    if (code === '??') untracked.push(file)
+  }
+  let diff = await git(['diff', 'HEAD', '--no-color', '--no-ext-diff'], cwd).catch(() => git(['diff', '--no-color', '--no-ext-diff'], cwd).catch(() => ''))
+  for (const f of untracked.slice(0, 20)) {
+    if (f.startsWith('.handsel/')) continue
+    try {
+      const st = await fs.stat(path.join(cwd, f))
+      if (!st.isFile() || st.size > 65_536) continue
+      // exit 1 means "differences", which is the whole point; execFile rejects on it.
+      const d = await new Promise((resolve) =>
+        execFile('git', ['diff', '--no-index', '--no-color', '/dev/null', f], { cwd, maxBuffer: 1 << 22 }, (e, stdout) => resolve(stdout || '')),
+      )
+      if (d) diff += (diff.endsWith('\n') || !diff ? '' : '\n') + d
+    } catch {
+      /* unreadable file: not in the diff, still in the list */
+    }
+  }
+  const head = await git(['rev-parse', 'HEAD'], cwd).then((h) => h.trim()).catch(() => null)
+  return { changedFiles: changedFiles.filter((f) => !f.startsWith('.handsel/')), deletedFiles, diff: diff.length > CHECKPOINT_PATCH_MAX ? diff.slice(0, CHECKPOINT_PATCH_MAX) : diff || null, head }
+}
+
+async function captureCheckpoint(run) {
+  if (run.done) return
+  const ws = await workspaceState(run.cwd, run.repo)
+  run.lastCheckpointAt = Date.now()
+  run.seq += 1
+  run.checkpoint = {
+    seq: run.seq,
+    summary: run.lastProgress ? `Last said: ${run.lastProgress}` : 'No progress text yet',
+    gitHead: ws.head,
+    patch: ws.diff,
+    filesChanged: ws.changedFiles,
+  }
+  run.changedFiles = ws.changedFiles
+  sessionNote(run, 'checkpoint', `checkpoint ${run.seq}: ${ws.changedFiles.length} file(s) changed`)
+}
+
+/** Everything the running session runs have to say since the last poll. */
+function drainSessionRuns() {
+  const out = []
+  for (const [runId, run] of sessionRuns) {
+    const report = { runId, events: run.events.splice(0, 60), changedFiles: run.changedFiles.slice(0, 200) }
+    if (run.checkpoint && run.reportedSeq !== run.checkpoint.seq) {
+      report.checkpoint = run.checkpoint
+      run.reportedSeq = run.checkpoint.seq
+    }
+    if (typeof run.costUsd === 'number') report.costUsd = run.costUsd
+    if (typeof run.tokensUsed === 'number') report.tokensUsed = run.tokensUsed
+    out.push(report)
+    if (run.done && run.events.length === 0) sessionRuns.delete(runId)
+  }
+  return out
+}
+
+function cancelSessionRuns(runIds) {
+  for (const id of runIds ?? []) {
+    const run = sessionRuns.get(id)
+    if (run && !run.done && !run.cancelled) {
+      run.cancelled = true
+      console.log(`\n[worker] session run ${id}: stop requested by the platform`)
+      try {
+        run.child?.kill()
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+}
+
+/**
+ * The poll's `session_pause` list is the set of this worker's runs whose
+ * session the owner paused. A listed run's harness process is stopped with
+ * SIGSTOP (it keeps its memory, its files and its place in the task); a run
+ * no longer listed is continued with SIGCONT. Progress keeps reporting either
+ * way, so the platform's heartbeat stays fresh and a paused run is never
+ * mistaken for a dead one. Windows has no SIGSTOP — there the pause is noted
+ * and the run keeps going, which the log says out loud.
+ */
+function pauseSessionRuns(runIds) {
+  const wanted = new Set(runIds ?? [])
+  for (const [id, run] of sessionRuns) {
+    if (run.done || run.cancelled || !run.child || run.child.exitCode !== null) continue
+    const shouldPause = wanted.has(id)
+    if (shouldPause === Boolean(run.paused)) continue
+    if (process.platform === 'win32') {
+      if (shouldPause && !run.pauseWarned) {
+        run.pauseWarned = true
+        console.log(`\n[worker] session run ${id}: pause requested, but this platform cannot stop a process — the run continues`)
+      }
+      continue
+    }
+    try {
+      run.child.kill(shouldPause ? 'SIGSTOP' : 'SIGCONT')
+      run.paused = shouldPause
+      sessionNote(run, 'progress', shouldPause ? 'paused by the owner (process stopped)' : 'resumed by the owner (process continued)')
+      console.log(`\n[worker] session run ${id}: ${shouldPause ? 'paused' : 'resumed'}`)
+    } catch {
+      /* already gone */
+    }
+  }
+}
+
+async function runVerify(command, cwd, run) {
+  const startedAt = Date.now()
+  sessionNote(run, 'tool', `$ ${command} (verification)`)
+  return new Promise((resolve) => {
+    let tail = ''
+    const child = spawn('/bin/sh', ['-c', command], { cwd, stdio: ['ignore', 'pipe', 'pipe'], env: process.env })
+    const timer = setTimeout(() => child.kill(), VERIFY_TIMEOUT_MS)
+    const onData = (d) => {
+      tail = (tail + d).slice(-8000)
+    }
+    child.stdout.on('data', onData)
+    child.stderr.on('data', onData)
+    child.on('error', (e) => {
+      clearTimeout(timer)
+      resolve({ command, exitCode: null, tail: `could not run: ${e.message}`, durationMs: Date.now() - startedAt })
+    })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      sessionNote(run, code === 0 ? 'progress' : 'error', `verification exited ${code}`)
+      resolve({ command, exitCode: code, tail: tail.slice(-4000), durationMs: Date.now() - startedAt })
+    })
+  })
+}
+
+async function runSessionRun(handout) {
+  const run = {
+    id: handout.run_id,
+    cwd: handout.grant?.workdir ? path.resolve(String(handout.grant.workdir)) : '',
+    repo: false,
+    events: [],
+    changedFiles: [],
+    seq: 0,
+    reportedSeq: 0,
+    checkpoint: null,
+    lastProgress: '',
+    child: null,
+    paused: false,
+    cancelled: false,
+    done: false,
+    costUsd: undefined,
+    tokensUsed: undefined,
+    harnessSessionId: null,
+    resultText: null,
+    shellUsed: false,
+  }
+  sessionRuns.set(run.id, run)
+  console.log(`\n[worker] session run ${run.id} (task ${handout.task_id}) in ${run.cwd || '(no workdir)'}`)
+  const finish = (payload) =>
+    platformPost('/api/worker/session-run', { agent_id: AGENT_ID, run_id: run.id, ...payload }).catch((e) => {
+      console.error(`[worker] session-run report failed: ${e.message}`)
+      return null
+    })
+  const fail = async (failureCode, error) => {
+    sessionNote(run, 'error', error)
+    run.done = true
+    console.log(`[worker] session run ${run.id} FAILED: ${error}`)
+    await finish({ ok: false, failure_code: failureCode, error: String(error).slice(0, 500), changed_files: run.changedFiles, checkpoint: run.checkpoint })
+  }
+  try {
+    // The grant's working directory is the boundary — and the one thing the
+    // platform cannot check for us. Refuse anything but an existing
+    // directory INSIDE the directory this worker was started with (when one
+    // was given): the owner started this process with --workdir as the
+    // widest thing it may touch, and a grant does not widen that.
+    if (!run.cwd) return await fail('AUTH-001', 'no working directory in the grant')
+    const st = await fs.stat(run.cwd).catch(() => null)
+    if (!st || !st.isDirectory()) return await fail('DEP-003', `working directory does not exist: ${run.cwd}`)
+    if (WORKDIR && run.cwd !== WORKDIR && !run.cwd.startsWith(WORKDIR + path.sep)) {
+      return await fail('AUTH-001', `grant workdir ${run.cwd} is outside this worker's --workdir ${WORKDIR}`)
+    }
+    if (!HARNESS) return await fail('DEP-002', 'no coding harness on this worker — start it with --harness claude (or codex, opencode, cline, gemini)')
+    run.repo = await isGitRepo(run.cwd)
+
+    // Resume: the previous attempt's patch, when this checkout no longer carries it.
+    if (handout.resume?.patch && run.repo) {
+      const current = await git(['status', '--porcelain'], run.cwd).catch(() => 'x')
+      if (!current.trim()) {
+        const tmp = path.join(os.tmpdir(), `handsel-resume-${run.id}.patch`)
+        await fs.writeFile(tmp, handout.resume.patch)
+        const applied = await git(['apply', '--check', tmp], run.cwd)
+          .then(() => git(['apply', tmp], run.cwd))
+          .then(() => true)
+          .catch(() => false)
+        await fs.unlink(tmp).catch(() => {})
+        sessionNote(run, 'checkpoint', applied ? `resumed: previous attempt's patch re-applied (${handout.resume.checkpointId})` : `resume: previous patch did not apply cleanly; starting from the brief's description of it`)
+      } else {
+        sessionNote(run, 'checkpoint', `resumed: working tree already carries changes (${handout.resume.checkpointId})`)
+      }
+    }
+
+    const rel = handout.deliverable_path || '.handsel/session-deliverable.md'
+    const abs = path.resolve(run.cwd, rel)
+    await fs.mkdir(path.dirname(abs), { recursive: true })
+    await fs.unlink(abs).catch(() => {})
+
+    const grant = handout.grant
+    const model = flag('harness-model') ?? null
+    // Claude Code takes the brief on STDIN for a session run: its tool
+    // flags are variadic and a positional after them is read as a tool name
+    // (lib/coding-harness.ts records the run that found this).
+    const argv =
+      HARNESS.id === 'claude'
+        ? claudeSessionArgv({ grant, model, resumeSessionId: null })
+        : (harnessSessionArgv({ harnessId: HARNESS.id, grant, model, brief: handout.brief, workdir: run.cwd }) ?? HARNESS.argv({ brief: handout.brief, workdir: run.cwd, model }))
+    const briefOnStdin = HARNESS.id === 'claude' || Boolean(HARNESS.briefOnStdin)
+    sessionNote(run, 'started', `${HARNESS.label} started (${HARNESS.id === 'claude' ? 'stream-json' : 'stdout'})`)
+    const timeoutMs = Math.max(60_000, Number(handout.timeout_ms) || HARNESS_TIMEOUT_MS)
+    const startedAt = Date.now()
+    const { code, timedOut } = await new Promise((resolve) => {
+      const child = spawn(HARNESS.bin, argv, { cwd: run.cwd, stdio: [briefOnStdin ? 'pipe' : 'ignore', 'pipe', 'pipe'], env: process.env })
+      run.child = child
+      let pending = ''
+      let timedOut = false
+      const timer = setTimeout(() => {
+        timedOut = true
+        child.kill()
+      }, timeoutMs)
+      const ticker = setInterval(() => captureCheckpoint(run).catch(() => {}), CHECKPOINT_EVERY_MS)
+      if (briefOnStdin) child.stdin.end(handout.brief)
+      child.stdout.on('data', (d) => {
+        pending += d
+        const lines = pending.split('\n')
+        pending = lines.pop() ?? ''
+        for (const line of lines) {
+          if (HARNESS.id === 'claude') claudeLineEvents(run, line)
+          else if (line.trim()) sessionNote(run, 'stdout', line)
+        }
+      })
+      child.stderr.on('data', (d) => {
+        for (const line of String(d).split('\n')) if (line.trim()) sessionNote(run, 'stderr', line)
+      })
+      child.on('error', (e) => {
+        clearTimeout(timer)
+        clearInterval(ticker)
+        sessionNote(run, 'error', `could not run ${HARNESS.bin}: ${e.message}`)
+        resolve({ code: null, timedOut: false })
+      })
+      child.on('close', (code) => {
+        clearTimeout(timer)
+        clearInterval(ticker)
+        if (pending.trim()) HARNESS.id === 'claude' ? claudeLineEvents(run, pending) : sessionNote(run, 'stdout', pending)
+        resolve({ code, timedOut })
+      })
+    })
+    run.child = null
+    sessionNote(run, 'exit', `${HARNESS.label} exited ${code}${timedOut ? ' (timeout)' : ''}${run.cancelled ? ' (cancelled)' : ''}`)
+    await captureCheckpoint(run).catch(() => {})
+    if (run.cancelled) return await fail('TIM-003', 'cancelled by the platform')
+    if (timedOut) return await fail('TIM-002', `harness exceeded the run timeout (${Math.round(timeoutMs / 1000)}s)`)
+
+    const ws = await workspaceState(run.cwd, run.repo)
+    run.changedFiles = ws.changedFiles
+    let deliverable = await fs.readFile(abs, 'utf8').catch(() => null)
+    if (!deliverable || !deliverable.trim()) deliverable = run.resultText
+    // A harness that exited non-zero having produced nothing did not work;
+    // submitting an empty deliverable for verification would grade the
+    // fixture's own failing test as THIS run's failure and hide the real
+    // cause (the harness's last words) behind a test log.
+    if (code !== 0 && !deliverable && ws.changedFiles.length === 0 && ws.deletedFiles.length === 0) {
+      const lastErr = run.events.filter((e) => e.kind === 'stderr' || e.kind === 'error').slice(-3).map((e) => e.text).join(' / ')
+      return await fail('DET-001', `${HARNESS.label} exited ${code} and produced nothing${lastErr ? `: ${lastErr}` : ''}`)
+    }
+    let tests = null
+    if (handout.verify_command && grant?.shell) tests = await runVerify(String(handout.verify_command), run.cwd, run)
+    run.done = true
+    const elapsed = Math.round((Date.now() - startedAt) / 1000)
+    console.log(`\n[worker] session run ${run.id}: ${ws.changedFiles.length} file(s) changed, ${tests ? `verification exit ${tests.exitCode}, ` : ''}${elapsed}s`)
+    await finish({
+      ok: true,
+      exit_code: code,
+      deliverable: deliverable ? deliverable.trim().slice(0, 200_000) : null,
+      diff: ws.diff,
+      changed_files: ws.changedFiles,
+      deleted_files: ws.deletedFiles,
+      tests,
+      cost_usd: run.costUsd,
+      tokens_used: run.tokensUsed,
+      harness_session_id: run.harnessSessionId,
+      checkpoint: run.checkpoint,
+    })
+  } catch (e) {
+    await fail('DET-000', e instanceof Error ? e.message : String(e))
+  }
+}
+
+const FFMPEG = await detectFfmpeg()
+console.log(FFMPEG.present ? `[worker] ffmpeg    ${FFMPEG.version}` : '[worker] ffmpeg    not found — media jobs will not be offered')
+
+console.log(
+  `[worker] polling every ${POLL_MS / 1000}s` +
+    (CONCURRENCY > 1 ? `, up to ${CONCURRENCY} jobs at once` : '') +
+    ` — Ctrl+C to stop\n`,
+)
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// Single poll driver, K executor slots. The driver serialises polling (so the
+// platform's in-poll auto-mine — which does on-chain accepts sharing this
+// agent's account nonce — never runs concurrently with itself), then hands
+// each returned task to a free slot that runs it in the background. With
+// CONCURRENCY === 1 this behaves exactly like the old serial loop.
+let active = 0
+let consecutiveErrors = 0
+for (;;) {
+  if (active >= CONCURRENCY) {
+    // Full, but a session run in flight still has to be HEARD: its progress,
+    // checkpoints and heartbeat ride the poll, and a worker that goes quiet
+    // for five minutes is declared dead by the platform even while its
+    // harness is working. So poll anyway, with capacity 0 — the platform
+    // hands out nothing and folds the reports. The first end-to-end runs
+    // showed every checkpoint landing only after the run had finished,
+    // which is exactly when it is no longer worth anything.
+    if (sessionRuns.size > 0) {
+      try {
+        const heard = await platformPost('/api/worker/poll', {
+          agent_id: AGENT_ID,
+          harness: HARNESS ? HARNESS.id : null,
+          capacity: 0,
+          session_capacity: 0,
+          runs: drainRuns(),
+          session_runs: drainSessionRuns(),
+        })
+        cancelSessionRuns(heard.session_cancel)
+        pauseSessionRuns(heard.session_pause)
+      } catch (e) {
+        console.error(`\n[worker] report poll failed: ${e instanceof Error ? e.message : e}`)
+      }
+    }
+    await sleep(POLL_MS)
+    continue
+  }
+
+  let task
+  let sessionRun = null
+  try {
+    // The harness is reported on every poll, not once at startup: a worker
+    // gets restarted with a different --harness all the time, and a value
+    // stored once would go on describing the tool that used to be here.
+    const polled = await platformPost('/api/worker/poll', {
+      agent_id: AGENT_ID,
+      harness: HARNESS ? HARNESS.id : null,
+      // Declared from a probe, so the match is on a machine that has the
+      // tool rather than on a promise that it does.
+      capabilities: FFMPEG.present ? ['text', 'video'] : ['text'],
+      ffmpeg: FFMPEG.version,
+      // Whatever the running jobs have to say since the last poll. Drained
+      // here rather than pushed on a timer of its own: the poll is already
+      // an authenticated round trip on a few-second cadence, and a second
+      // channel would be a second thing to get wrong.
+      runs: drainRuns(),
+      // Office-session runs: their progress, checkpoints and heartbeat ride
+      // the same round trip; the reply may carry a run to start and runs to stop.
+      session_runs: drainSessionRuns(),
+    })
+    task = polled.task
+    sessionRun = polled.session_run ?? null
+    cancelSessionRuns(polled.session_cancel)
+    pauseSessionRuns(polled.session_pause)
+    consecutiveErrors = 0
+  } catch (e) {
+    consecutiveErrors += 1
+    console.error(`\n[worker] poll failed (${consecutiveErrors}): ${e instanceof Error ? e.message : e}`)
+    if (consecutiveErrors >= 5) {
+      console.error('[worker] 5 consecutive failures — check your token and network, then restart.')
+      process.exit(1)
+    }
+    await sleep(POLL_MS)
+    continue
+  }
+
+  if (sessionRun) {
+    active += 1
+    runSessionRun(sessionRun)
+      .catch((e) => console.error(`\n[worker] session run ${sessionRun.run_id} crashed: ${e instanceof Error ? e.message : e}`))
+      .finally(() => {
+        active -= 1
+      })
+    if (active < CONCURRENCY) continue
+    await sleep(POLL_MS)
+  } else if (task) {
+    active += 1
+    // Run in the background; free the slot when done. Never let one task's
+    // failure take down the loop — runOne already reports failures upstream.
+    runOne(task)
+      .catch((e) => console.error(`\n[worker] task ${task.task_id} crashed: ${e instanceof Error ? e.message : e}`))
+      .finally(() => {
+        active -= 1
+      })
+    // Slots free → poll again immediately to fill the next one; the poll's own
+    // network latency paces this, so it's not a busy-spin.
+    if (active < CONCURRENCY) continue
+    await sleep(POLL_MS)
+  } else {
+    process.stdout.write('.')
+    await sleep(POLL_MS)
+  }
+}

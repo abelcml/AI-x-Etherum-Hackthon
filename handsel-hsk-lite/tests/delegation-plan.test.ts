@@ -1,0 +1,436 @@
+/**
+ * Planner-output guardrail tests. These checks are what stand between a
+ * misbehaving/jailbroken planner LLM and real escrowed money, so they get
+ * pinned: count bounds, per-subtask validation, and the budget ceiling.
+ */
+import { describe, it, expect } from 'vitest'
+import {
+  parsePlannerOutput,
+  parseReviewVerdict,
+  reviewTierGate,
+  finalReviewerFor,
+  reviewVerdictStandard,
+  reReviewBrief,
+  MAX_SUBTASKS,
+  MAX_REVIEW_TIERS,
+  MAX_REVISION_ROUNDS,
+  type DelegationSubtask,
+} from '@/lib/delegation'
+
+const goodSubtask = (over: Record<string, unknown> = {}) => ({
+  title: 'Write flatten(xs)',
+  description: 'Write a self-contained Python function flatten(xs)…',
+  acceptanceCriteria: 'A function named flatten that flattens one level.',
+  bountyUsd: 5,
+  ...over,
+})
+
+describe('parsePlannerOutput', () => {
+  it('parses a valid plan and normalizes bounties to cents', () => {
+    const out = parsePlannerOutput(JSON.stringify([goodSubtask({ bountyUsd: 4.999 })]), 15)
+    expect(out).toHaveLength(1)
+    expect(out[0].bountyUsd).toBe(5)
+    expect(out[0].testCode).toBeNull()
+  })
+
+  it('strips markdown code fences before parsing', () => {
+    const fenced = '```json\n' + JSON.stringify([goodSubtask()]) + '\n```'
+    expect(parsePlannerOutput(fenced, 15)).toHaveLength(1)
+  })
+
+  it('keeps testCode when present and non-empty', () => {
+    const out = parsePlannerOutput(JSON.stringify([goodSubtask({ testCode: 'assert flatten([[1]]) == [1]' })]), 15)
+    expect(out[0].testCode).toContain('assert')
+  })
+
+  it('rejects unparseable output', () => {
+    expect(() => parsePlannerOutput('sure! here is the plan:', 15)).toThrow(/unparseable/)
+  })
+
+  it('rejects an empty plan and an oversized plan', () => {
+    expect(() => parsePlannerOutput('[]', 15)).toThrow()
+    const tooMany = Array.from({ length: MAX_SUBTASKS + 1 }, () => goodSubtask({ bountyUsd: 1 }))
+    expect(() => parsePlannerOutput(JSON.stringify(tooMany), 100)).toThrow()
+  })
+
+  it('rejects subtasks missing required fields', () => {
+    expect(() => parsePlannerOutput(JSON.stringify([goodSubtask({ title: '' })]), 15)).toThrow(/missing/)
+    expect(() => parsePlannerOutput(JSON.stringify([goodSubtask({ acceptanceCriteria: 'short' })]), 15)).toThrow(/missing/)
+  })
+
+  it('rejects invalid bounties', () => {
+    expect(() => parsePlannerOutput(JSON.stringify([goodSubtask({ bountyUsd: 0 })]), 15)).toThrow(/invalid bounty/)
+    expect(() => parsePlannerOutput(JSON.stringify([goodSubtask({ bountyUsd: 'free' })]), 15)).toThrow(/invalid bounty/)
+  })
+
+  it('rejects a plan whose bounties exceed the budget — the hard money guard', () => {
+    const plan = [goodSubtask({ bountyUsd: 8 }), goodSubtask({ bountyUsd: 8 })]
+    expect(() => parsePlannerOutput(JSON.stringify(plan), 15)).toThrow(/exceeded the budget/)
+  })
+
+  it('accepts a plan exactly at budget', () => {
+    const plan = [goodSubtask({ bountyUsd: 7.5 }), goodSubtask({ bountyUsd: 7.5 })]
+    expect(parsePlannerOutput(JSON.stringify(plan), 15)).toHaveLength(2)
+  })
+
+  // --- dependency graph (dependsOn) — the DAG handoff ---
+
+  const A = goodSubtask({ title: 'Draft the copy', bountyUsd: 4 })
+  const B = (over: Record<string, unknown> = {}) =>
+    goodSubtask({ title: 'Polish the copy', bountyUsd: 4, ...over })
+
+  it('parses a valid handoff and carries dependsOn through', () => {
+    const out = parsePlannerOutput(JSON.stringify([A, B({ dependsOn: ['Draft the copy'] })]), 15)
+    expect(out[1].dependsOn).toEqual(['Draft the copy'])
+    expect(out[0].dependsOn).toBeUndefined()
+  })
+
+  it('dedupes repeated dependency titles', () => {
+    const out = parsePlannerOutput(
+      JSON.stringify([A, B({ dependsOn: ['Draft the copy', 'Draft the copy'] })]),
+      15,
+    )
+    expect(out[1].dependsOn).toEqual(['Draft the copy'])
+  })
+
+  it('rejects a dependency on an unknown subtask', () => {
+    expect(() =>
+      parsePlannerOutput(JSON.stringify([A, B({ dependsOn: ['Nonexistent'] })]), 15),
+    ).toThrow(/unknown subtask/)
+  })
+
+  it('rejects a self-dependency', () => {
+    expect(() =>
+      parsePlannerOutput(JSON.stringify([B({ dependsOn: ['Polish the copy'] })]), 15),
+    ).toThrow(/depends on itself/)
+  })
+
+  it('rejects a circular dependency', () => {
+    const a = goodSubtask({ title: 'A', bountyUsd: 4, dependsOn: ['B'] })
+    const b = goodSubtask({ title: 'B', bountyUsd: 4, dependsOn: ['A'] })
+    expect(() => parsePlannerOutput(JSON.stringify([a, b]), 15)).toThrow(/circular/)
+  })
+
+  // --- peer review (reviewOf) ---
+
+  it('parses a peer review and auto-depends it on its target', () => {
+    const out = parsePlannerOutput(
+      JSON.stringify([A, B({ title: 'Review the copy', reviewOf: 'Draft the copy' })]),
+      15,
+    )
+    const rev = out.find((s) => s.reviewOf)!
+    expect(rev.reviewOf).toBe('Draft the copy')
+    expect(rev.dependsOn).toContain('Draft the copy') // review implies dependency
+  })
+
+  it('rejects a review of an unknown or self subtask, and a review of a review', () => {
+    expect(() =>
+      parsePlannerOutput(JSON.stringify([A, B({ title: 'R', reviewOf: 'Nope' })]), 15),
+    ).toThrow(/reviews unknown/)
+    expect(() =>
+      parsePlannerOutput(JSON.stringify([B({ title: 'R', reviewOf: 'R' })]), 15),
+    ).toThrow(/reviews itself/)
+    const r1 = goodSubtask({ title: 'R1', bountyUsd: 4, reviewOf: 'Draft the copy' })
+    const r2 = goodSubtask({ title: 'R2', bountyUsd: 4, reviewOf: 'R1' })
+    expect(() => parsePlannerOutput(JSON.stringify([A, r1, r2]), 15)).toThrow(/review another review/)
+  })
+
+  // --- approval chain (reviewTier) — 기안 → 1차 → 2차 → 최종 ---
+
+  it('accepts a single reviewer with no explicit tier (unchanged default behavior)', () => {
+    const out = parsePlannerOutput(
+      JSON.stringify([A, B({ title: 'Review the copy', reviewOf: 'Draft the copy' })]),
+      15,
+    )
+    expect(out.find((s) => s.reviewOf)!.reviewTier).toBeUndefined()
+  })
+
+  it('accepts a contiguous 1..N chain of reviewers for the same target', () => {
+    const r1 = B({ title: 'R1', bountyUsd: 4, reviewOf: 'Draft the copy', reviewTier: 1 })
+    const r2 = B({ title: 'R2', bountyUsd: 4, reviewOf: 'Draft the copy', reviewTier: 2 })
+    const out = parsePlannerOutput(JSON.stringify([A, r1, r2]), 15)
+    expect(out.find((s) => s.title === 'R1')!.reviewTier).toBe(1)
+    expect(out.find((s) => s.title === 'R2')!.reviewTier).toBe(2)
+  })
+
+  it('rejects a gap in the chain (tiers 1 and 3, no 2)', () => {
+    const r1 = B({ title: 'R1', bountyUsd: 4, reviewOf: 'Draft the copy', reviewTier: 1 })
+    const r3 = B({ title: 'R3', bountyUsd: 4, reviewOf: 'Draft the copy', reviewTier: 3 })
+    expect(() => parsePlannerOutput(JSON.stringify([A, r1, r3]), 15)).toThrow(/1\.\.2 approval chain/)
+  })
+
+  it('rejects a duplicate tier', () => {
+    const r1 = B({ title: 'R1', bountyUsd: 4, reviewOf: 'Draft the copy', reviewTier: 1 })
+    const r1b = B({ title: 'R1b', bountyUsd: 4, reviewOf: 'Draft the copy', reviewTier: 1 })
+    expect(() => parsePlannerOutput(JSON.stringify([A, r1, r1b]), 15)).toThrow(/1\.\.2 approval chain/)
+  })
+
+  it('rejects a chain longer than MAX_REVIEW_TIERS', () => {
+    const reviews = Array.from({ length: MAX_REVIEW_TIERS + 1 }, (_, i) =>
+      B({ title: `R${i + 1}`, bountyUsd: 1, reviewOf: 'Draft the copy', reviewTier: i + 1 }),
+    )
+    expect(() => parsePlannerOutput(JSON.stringify([A, ...reviews]), 15)).toThrow(/at most \d+ approval tiers/)
+  })
+
+  // --- office-scoped review (officeOnly) ---
+
+  it('carries officeOnly through when set true on a review subtask', () => {
+    const out = parsePlannerOutput(
+      JSON.stringify([A, B({ title: 'Review the copy', reviewOf: 'Draft the copy', officeOnly: true })]),
+      15,
+    )
+    expect(out.find((s) => s.reviewOf)!.officeOnly).toBe(true)
+  })
+
+  it('drops officeOnly when absent or false — no field, not a stored false', () => {
+    const out = parsePlannerOutput(
+      JSON.stringify([A, B({ title: 'Review the copy', reviewOf: 'Draft the copy', officeOnly: false })]),
+      15,
+    )
+    expect(out.find((s) => s.reviewOf)!.officeOnly).toBeUndefined()
+  })
+
+  it('ignores officeOnly on a non-review subtask — it only means something paired with reviewOf', () => {
+    const out = parsePlannerOutput(JSON.stringify([{ ...A, officeOnly: true }]), 15)
+    expect(out[0].officeOnly).toBeUndefined()
+  })
+})
+
+describe('parseReviewVerdict', () => {
+  it('reads an explicit approval', () => {
+    expect(parseReviewVerdict('APPROVE — reads well').approve).toBe(true)
+    expect(parseReviewVerdict('LGTM').approve).toBe(true)
+  })
+  it('reads a revision request, and REVISE wins over a stray approve word', () => {
+    expect(parseReviewVerdict('REVISE: tighten the second sentence').approve).toBe(false)
+    expect(parseReviewVerdict('I would approve it, but please REVISE the ending').approve).toBe(false)
+  })
+  it("a first-line APPROVE is not overruled by REVISE-shaped words in the body", () => {
+    // Live (2026-09-01): the reviewer opened with APPROVE and then discussed
+    // the previously FAILED sourcing being fixed — the anywhere-scan read
+    // "failed" as a REVISE and burned a revision round against an approval.
+    // The brief puts the verdict on the first line; the first line decides.
+    expect(parseReviewVerdict('APPROVE — every figure now sourced.\nThe previously failed numbers were fixed in round 1.').approve).toBe(true)
+    // Within the first line REVISE still outranks APPROVE ("approve only if…").
+    expect(parseReviewVerdict('APPROVE only if X, otherwise REVISE\ndetails…').approve).toBe(false)
+    // No verdict on the first line: the body scan remains, REVISE winning.
+    expect(parseReviewVerdict('Summary of findings\nplease revise the ending').approve).toBe(false)
+    expect(parseReviewVerdict('Summary of findings\nI approve this').approve).toBe(true)
+  })
+  it('treats an unclear verdict as a revision — silence is not approval', () => {
+    expect(parseReviewVerdict('hmm, interesting work').approve).toBe(false)
+  })
+})
+
+describe('reviewTierGate — the approval chain never runs a later sign-off ahead of an earlier one', () => {
+  const st = (over: Partial<DelegationSubtask> & { title: string }): DelegationSubtask => ({
+    description: '',
+    acceptanceCriteria: '',
+    bountyUsd: 1,
+    ...over,
+  })
+
+  it('tier 1 (or unset) is always ready — no prior tier to wait on', () => {
+    expect(reviewTierGate([], st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1 }))).toEqual({ state: 'ready' })
+    expect(reviewTierGate([], st({ title: 'R1', reviewOf: 'Draft' }))).toEqual({ state: 'ready' }) // unset == tier 1
+  })
+
+  it('tier 2 is blocked while tier 1 has not delivered a verdict yet', () => {
+    const tier1 = st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1 }) // output still null
+    const tier2 = st({ title: 'R2', reviewOf: 'Draft', reviewTier: 2 })
+    expect(reviewTierGate([tier1, tier2], tier2)).toEqual({ state: 'blocked' })
+  })
+
+  it('tier 2 becomes ready the moment tier 1 delivers an APPROVE', () => {
+    const tier1 = st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1, output: 'APPROVE — looks good' })
+    const tier2 = st({ title: 'R2', reviewOf: 'Draft', reviewTier: 2 })
+    expect(reviewTierGate([tier1, tier2], tier2)).toEqual({ state: 'ready' })
+  })
+
+  it('tier 2 is aborted — never posted — when tier 1 delivers a REVISE', () => {
+    const tier1 = st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1, output: 'REVISE: fix the tone' })
+    const tier2 = st({ title: 'R2', reviewOf: 'Draft', reviewTier: 2 })
+    expect(reviewTierGate([tier1, tier2], tier2)).toEqual({ state: 'aborted', note: 'REVISE: fix the tone' })
+  })
+
+  it('an abort propagates forward: tier 3 aborts once tier 2 is marked failed from tier 1\'s revise', () => {
+    const tier1 = st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1, output: 'REVISE: no' })
+    const tier2 = st({ title: 'R2', reviewOf: 'Draft', reviewTier: 2, failed: true, failReason: 'approval chain aborted — REVISE: no' })
+    const tier3 = st({ title: 'R3', reviewOf: 'Draft', reviewTier: 3 })
+    expect(reviewTierGate([tier1, tier2, tier3], tier3)).toEqual({
+      state: 'aborted',
+      note: 'approval chain aborted — REVISE: no',
+    })
+  })
+})
+
+describe('finalReviewerFor — the reviewer whose verdict actually decides the target', () => {
+  const st = (over: Partial<DelegationSubtask> & { title: string }): DelegationSubtask => ({
+    description: '',
+    acceptanceCriteria: '',
+    bountyUsd: 1,
+    ...over,
+  })
+
+  it('is the sole reviewer when there is only one — same as before chains existed', () => {
+    const only = st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1 })
+    expect(finalReviewerFor([only], 'Draft')).toBe(only)
+  })
+
+  it('is the highest tier when several are present, regardless of array order', () => {
+    const tier2 = st({ title: 'R2', reviewOf: 'Draft', reviewTier: 2 })
+    const tier1 = st({ title: 'R1', reviewOf: 'Draft', reviewTier: 1 })
+    const tier3 = st({ title: 'R3', reviewOf: 'Draft', reviewTier: 3 })
+    expect(finalReviewerFor([tier2, tier1, tier3], 'Draft')).toBe(tier3)
+  })
+
+  it('is undefined when the target has no reviewer at all', () => {
+    expect(finalReviewerFor([st({ title: 'Unrelated', reviewOf: 'Something else' })], 'Draft')).toBeUndefined()
+  })
+})
+
+describe('reviewVerdictStandard — the brief states when APPROVE is the right answer', () => {
+  // The first two live review conversations produced five verdicts and zero
+  // APPROVEs — including a REVISE on a revision that had addressed every
+  // prior note. A paid fault-finder needs the brief to say that approving
+  // sound work is also doing the job, or every reviewed synthesis ends in
+  // an owner hold and the hands-off pipeline can never finish.
+  it('ties both verdicts to the acceptance criteria', () => {
+    const s = reviewVerdictStandard()
+    expect(s).toContain('APPROVE when the deliverable satisfies the acceptance criteria')
+    expect(s).toContain('name the criterion')
+    expect(s).toContain('equally complete reviews')
+    expect(s).not.toContain('FINAL round')
+  })
+
+  it('the final round discloses what a REVISE now does', () => {
+    const s = reviewVerdictStandard(true)
+    expect(s).toContain('FINAL round')
+    expect(s).toContain('held for a human owner')
+  })
+
+  it('reaches both reviewer briefs — first review and re-review', () => {
+    const brief = reReviewBrief({
+      title: 'T',
+      acceptanceCriteria: 'C',
+      revisedOutput: 'out',
+      priorNote: 'note',
+      round: MAX_REVISION_ROUNDS,
+      finalRound: true,
+      nonce: 'n',
+    })
+    expect(brief).toContain('APPROVE when the deliverable satisfies the acceptance criteria')
+    expect(brief).toContain('FINAL round')
+    // The first-review header is composed inline in the tick — pin the call.
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    const src = readFileSync('lib/delegation.ts', 'utf8')
+    const header = src.slice(src.indexOf('The work to review — judge it against the criteria'), src.indexOf('Inputs from upstream work'))
+    expect(header).toContain('reviewVerdictStandard()')
+  })
+
+  it('a non-final re-review does not claim finality', () => {
+    const brief = reReviewBrief({
+      title: 'T',
+      acceptanceCriteria: 'C',
+      revisedOutput: 'out',
+      priorNote: 'note',
+      round: 1,
+      nonce: 'n',
+    })
+    expect(brief).not.toContain('FINAL round')
+  })
+})
+
+describe('a wave posts only what its payer can afford — checked at posting time', () => {
+  // Balances move between waves: a second pipeline on the same payer spent
+  // the wallet a wave was counting on (observed live 2026-09-01), and the
+  // wave surfaced as an opaque on-chain revert retry loop that consumed the
+  // whole delegation tick. The pre-check turns that into the same
+  // actionable row error the confirm path already produces.
+  it('postOneSubtask reads the payer balance before the post — as ADVICE, never the gate', () => {
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    const src = readFileSync('lib/delegation.ts', 'utf8')
+    const body = src.slice(src.indexOf('async function postOneSubtask'), src.indexOf('export async function postDelegationJobs'))
+    const checkAt = body.indexOf('usdcBalanceOf')
+    expect(checkAt).toBeGreaterThan(-1)
+    expect(checkAt).toBeLessThan(body.indexOf('await postJob('))
+    // The gating version held a fully-funded wave hostage to a provider
+    // serving five-minute-old state. A short read logs and posts anyway.
+    expect(body).toContain('posting anyway; the chain decides')
+    expect(body).not.toContain('mint test USDC on that agent')
+    expect(body).toContain('posting balance pre-check failed (continuing)')
+  })
+})
+
+describe('the model lane survives a dead Anthropic key (platform OpenAI-compat fallback)', () => {
+  // Live outage: the platform Anthropic key ran out of credits — a 400 no
+  // retry fixes — and planning, verification and text grading died together
+  // for hours. The same three values a BYOK entry stores can now come from
+  // env (OPENAI_COMPAT_BASE_URL/_API_KEY/_MODEL, e.g. OpenRouter), used as
+  // the last resort AND as an automatic failover when the Anthropic call
+  // fails on billing/auth specifically.
+  it('resolveLlm reads the platform compat env and fails over on billing errors only', () => {
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    const src = readFileSync('lib/delegation.ts', 'utf8')
+    expect(src).toContain('OPENAI_COMPAT_BASE_URL')
+    expect(src).toContain('OPENAI_COMPAT_API_KEY')
+    expect(src).toContain('OPENAI_COMPAT_MODEL')
+    const failover = src.slice(src.indexOf('const platformCompat'))
+    expect(failover).toContain('credit balance|billing|invalid x-api-key|authentication_error')
+    // Non-billing errors surface — they must not be laundered through a
+    // different provider.
+    expect(failover).toContain('throw error')
+  })
+})
+
+describe('PREFER_OPENAI_COMPAT — the compat gateway carries the text lane, Anthropic is the net', () => {
+  it('the compat-first branch exists, gated on the env switch, with failover to the Anthropic key', () => {
+    const { readFileSync } = require('node:fs') as typeof import('node:fs')
+    const src = readFileSync('lib/delegation.ts', 'utf8')
+    const at = src.indexOf("process.env.PREFER_OPENAI_COMPAT === 'true'")
+    expect(at).toBeGreaterThan(-1)
+    const block = src.slice(at, at + 900)
+    // Gateway-first failover is deliberately wide (any throw): a self-hosted
+    // router's dominant failure is unreachability.
+    expect(block).toContain('falling back to the platform Anthropic key')
+    // …and it must come BEFORE the anthropic-first branch, or the switch is
+    // decoration.
+    expect(at).toBeLessThan(src.indexOf('Anthropic key unusable'))
+  })
+})
+
+describe('LLM usage hygiene — the bill-cutting invariants', () => {
+  const { readFileSync } = require('node:fs') as typeof import('node:fs')
+  const src = readFileSync('lib/delegation.ts', 'utf8')
+
+  it('the stable system text is cached; the per-call nonce rides after the breakpoint', () => {
+    // cache_control on the stable block only — a nonce inside the cached
+    // prefix would invalidate it on every call, which is how the cache hit
+    // rate was 0% for the life of the platform.
+    const at = src.indexOf("cache_control: { type: 'ephemeral' }")
+    expect(at).toBeGreaterThan(-1)
+    expect(src.slice(at - 200, at)).toContain('text: stable')
+    expect(src).toContain('volatile ? [{ type:')
+  })
+
+  it('verdict-shaped calls run at effort low; the planner does not', () => {
+    const verifier = src.slice(src.indexOf('async function verifySubmission'))
+    expect(verifier).toContain("{ effort: 'low' }")
+    const planner = src.slice(src.indexOf('const planOnce'), src.indexOf('parsePlannerOutput(text'))
+    expect(planner).not.toContain('effort')
+    const grader = readFileSync('lib/text-grading.ts', 'utf8')
+    expect(grader).toContain("{ effort: 'low' }")
+  })
+
+  it('the verifier and grader cap the description as context — criteria stay whole', () => {
+    const verifier = src.slice(src.indexOf('async function verifySubmission'))
+    expect(verifier).toContain('context cut for verification')
+    expect(verifier).toContain('${st.acceptanceCriteria}')
+    const grader = readFileSync('lib/text-grading.ts', 'utf8')
+    expect(grader).toContain('context cut for grading')
+  })
+
+  it('the text-lane model is env-overridable, defaulting to the owner-chosen tier', () => {
+    expect(src).toContain("process.env.PLATFORM_LLM_MODEL || 'claude-opus-4-8'")
+  })
+})
