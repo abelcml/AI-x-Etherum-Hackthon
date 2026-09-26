@@ -1,6 +1,17 @@
 const $=id=>document.getElementById(id);
 let configuration,scenario='code',jobs=[],jobStatus=null,receipt=null,csvExpected=null,ticket=null,busy=false;
 const esc=value=>String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const stateHint=document.createElement('p');stateHint.id='job-state-note';stateHint.className='hint';$('code-execution').prepend(stateHint);
+function updateActions(){
+  const states={accept:'Open',submit:'Accepted',settle:'Submitted'};
+  for(const [id,required] of Object.entries(states)){
+    $(id).disabled=busy||!jobStatus||jobStatus.status!==required;
+    $(id).title=!jobStatus?'先读取链上任务状态':jobStatus.status!==required?`要求 ${required}，当前为 ${jobStatus.status}`:'';
+  }
+  const recovery={cancel:'Open',reclaim:'Accepted','expire-open':'Open','expire-review':'Submitted'};
+  $('recover').disabled=busy||!jobStatus||jobStatus.status!==recovery[$('recovery-action').value];
+  stateHint.textContent=!jobStatus?'先读取任务状态。GitHub 验收可独立执行。':jobStatus.status==='Completed'?'任务已完成，不能重复提交或结算。可验证 PR 或查看交易证据。':jobStatus.status==='Refunded'?'任务已退款，不能再次提交。重跑流程请发布新任务。':`当前任务状态：${jobStatus.status}。仅开放该状态允许的操作。`;
+}
 async function api(path,input) {
   const response=await fetch(path,{method:input===undefined?'GET':'POST',headers:input===undefined?{}:{'Content-Type':'application/json','X-Commons-CSRF':configuration?.csrf||''},body:input===undefined?undefined:JSON.stringify(input)});
   let data;try{data=await response.json();}catch{throw new Error('服务未返回 JSON，请检查登录或服务地址');}
@@ -10,15 +21,17 @@ async function api(path,input) {
 function display(data) {$('result').textContent=JSON.stringify(data,null,2);}
 function evidence(data) {
   receipt=data;$('download-receipt').disabled=!data;
-  $('evidence-summary').textContent=!data?'尚未验证':data.verified===true||data.passed===true?'验收通过（未付款）':'验收失败';
+  $('evidence-summary').textContent=!data?'尚未验证':data.verified===true||data.passed===true?'验收通过':'验收失败';
+  $('evidence-summary').classList.toggle('good',Boolean(data&&(data.verified===true||data.passed===true)));
+  $('evidence-summary').classList.toggle('bad',Boolean(data&&data.verified!==true&&data.passed!==true));
   const rows=!data?[['验收状态','未执行']]:Object.entries(data).filter(([key])=>!['checks','log','policy'].includes(key)).map(([key,value])=>[key,typeof value==='object'?JSON.stringify(value):value]);
   $('checks').innerHTML=rows.map(([key,value])=>`<tr><td>${esc(key)}</td><td>${esc(value)}</td></tr>`).join('');
 }
 function invalidate() {evidence(null);$('status').textContent=scenario==='csv'?'待验收':jobStatus?.status||'待验收';}
 async function operation(fn) {
-  if(busy)return;busy=true;$('action-note').textContent='正在读取或执行实际接口…';document.body.setAttribute('aria-busy','true');
-  try{await fn();}catch(error){display(error.details||{error:error.message});$('action-note').textContent=error.message;}
-  finally{busy=false;document.body.removeAttribute('aria-busy');}
+  if(busy)return;busy=true;updateActions();$('action-note').textContent='正在读取或执行实际接口…';$('action-note').classList.remove('error');document.body.setAttribute('aria-busy','true');
+  try{await fn();}catch(error){display(error.details||{error:error.message});$('action-note').textContent=error.message;$('action-note').classList.add('error');}
+  finally{busy=false;updateActions();document.body.removeAttribute('aria-busy');}
 }
 function jobId(){const value=$('job-id').value.trim();if(!/^[1-9]\d*$/.test(value))throw new Error('先选择任务或填写链上任务 ID');return value;}
 async function refresh() {
@@ -28,11 +41,13 @@ async function refresh() {
   $('config-status').textContent=configuration.missing.length?`待配置：${configuration.missing.join('、')}`:'配置字段齐全；合约与 RPC 在操作时实际验证。';
   $('network-status').textContent=configuration.missing.some(key=>key.endsWith('_ADDRESS'))?'待配置合约':'操作时核对链';
   const data=await api('/api/jobs');jobs=data.jobs;
+  if($('record-count'))$('record-count').textContent=`${jobs.length} 份真实任务记录`;
   $('job-select').innerHTML='<option value="">选择真实任务</option>'+jobs.map(job=>`<option value="${esc(job.jobId)}">#${esc(job.jobId)} ${esc(job.title)}</option>`).join('');
   $('action-note').textContent=jobs.length?`已读取 ${jobs.length} 份 CLI 任务记录。`:'没有已发布的任务记录；CSV 可直接运行，GitHub 验收需配置仓库。';
 }
 async function loadJob() {
-  const data=await api(`/api/jobs/${jobId()}`);jobStatus=data.result;display(jobStatus);
+  const requestedId=jobId();jobStatus=null;updateActions();
+  const data=await api(`/api/jobs/${requestedId}`);if($('job-id').value.trim()!==requestedId)return;jobStatus=data.result;display(jobStatus);
   $('status').textContent=jobStatus.status;$('balance').textContent=jobStatus.bounty;
   $('balance-note').textContent=`Worker 可领取：${jobStatus.workerClaimable}；Requester 可领取：${jobStatus.requesterClaimable}。可领取不等于已到账。`;
   $('action-note').textContent='以上状态直接来自链上读取。';
@@ -50,7 +65,8 @@ function setScenario(value){
   if(busy)return;scenario=value;invalidate();$('status').textContent=value==='code'?'未读取链上状态':'等待 CSV 输入';
   for(const section of ['definition','execution','settlement']){ $(`code-${section}`).hidden=value!=='code';const csv=$(`csv-${section}`);if(csv)csv.hidden=value!=='csv';}
   $('scenario-code').classList.toggle('selected',value==='code');$('scenario-csv').classList.toggle('selected',value==='csv');
-  $('task-id').textContent=value==='code'?'GITHUB / HSK':'CSV / LOCAL VERIFIER';$('task-title').textContent=value==='code'?'任务发布、交付与验证':'CSV 去重与文件验收';
+  $('scenario-code').setAttribute('aria-pressed',String(value==='code'));$('scenario-csv').setAttribute('aria-pressed',String(value==='csv'));
+  $('task-id').textContent=value==='code'?'GITHUB / HSK':'CSV / 文件验收';$('task-title').textContent=value==='code'?'任务发布、交付与验证':'CSV 去重与文件验收';
   $('balance').textContent='—';$('balance-note').textContent=value==='code'?'尚未读取链上状态':'CSV 暂未接链上结算';
   $('pipeline').hidden=value==='csv';
 }
@@ -61,7 +77,9 @@ for(const button of document.querySelectorAll('[data-evidence-job]')) button.onc
 };
 $('refresh').onclick=()=>operation(refresh);$('load-job').onclick=()=>operation(loadJob);
 $('job-select').onchange=()=>operation(async()=>{const job=jobs.find(job=>String(job.jobId)===$('job-select').value);if(!job)return;$('job-id').value=job.jobId;$('pr-number').value=job.pr||'';$('submitted-sha').value=job.sha||'';invalidate();await loadJob();});
-for(const id of ['pr-number','submitted-sha','job-id'])$(id).addEventListener('input',invalidate);
+for(const id of ['pr-number','submitted-sha'])$(id).addEventListener('input',invalidate);
+$('job-id').addEventListener('input',()=>{jobStatus=null;invalidate();$('status').textContent='未读取链上状态';$('balance').textContent='—';$('balance-note').textContent='尚未读取链上状态';updateActions();});
+$('recovery-action').addEventListener('change',updateActions);
 $('post').onclick=()=>operation(()=>preview({action:'post',issueUrl:$('issue-url').value,title:$('new-title').value,bounty:$('bounty').value,window:Math.round(Number($('hours').value)*3600)}));
 for(const [id,action] of [['accept','accept'],['submit','submit'],['settle','settle']])$(id).onclick=()=>operation(()=>preview({action,jobId:jobId(),pr:$('pr-number').value}));
 $('recover').onclick=()=>operation(()=>preview({action:$('recovery-action').value,jobId:jobId()}));
@@ -86,9 +104,13 @@ $('verify').onclick=()=>operation(async()=>{
   try {
     if(scenario==='code')result=await api('/api/verify',{pr:$('pr-number').value,sha:$('submitted-sha').value});
     else {if(!csvExpected)throw new Error('先执行 CSV 去重以固定本轮输入和预期哈希');result=await api('/api/csv',{action:'verify',inputText:$('csv-input').value,outputText:$('csv-output').value,key:$('csv-key').value,expectedSha:csvExpected});}
-    display(result);evidence(result);$('status').textContent=result.verified||result.passed?'验收通过':'验收失败';$('action-note').textContent='验收结果来自真实接口，本操作不触发付款。';
+    display(result);evidence(result);$('status').textContent=scenario==='code'&&jobStatus?jobStatus.status:result.verified||result.passed?'验收通过':'验收失败';$('action-note').textContent='验收结果来自真实接口，本操作不触发付款。';
   }catch(error){evidence({verified:false,error:error.message});throw error;}
 });
 $('download-output').onclick=()=>download('result.csv',$('csv-output').value,'text/csv;charset=utf-8');
 $('download-receipt').onclick=()=>{if(receipt)download('verification-receipt.json',JSON.stringify(receipt,null,2),'application/json');};
+for(const link of document.querySelectorAll('.rail nav a'))link.addEventListener('click',()=>{
+  for(const item of document.querySelectorAll('.rail nav a')){item.classList.toggle('active',item===link);if(item===link)item.setAttribute('aria-current','location');else item.removeAttribute('aria-current');}
+  const target=document.querySelector(link.getAttribute('href'));if(target?.tagName==='DETAILS')target.open=true;
+});
 operation(refresh);
