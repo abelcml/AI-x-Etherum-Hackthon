@@ -1,6 +1,6 @@
 # 【团队必读】HSK 项目完成状态与剩余工作
 
-> 状态基于团队 `main`（`d5eaf64`，含 PR #11、队友 A 的演示页、任务记录和操作交接）及队友 B 的本 PR 改动。
+> 状态基于团队 `main`（`bd8e60b`，含队友 A 的演示页与队友 B 的独立通用框架包），并整合 PR #13 的 Task Commons 页面样式与生命周期操作修复。
 >
 > 当前结论：**旧版 GitHub 流程的 job 1、3 已真实付款，job 2 已超时退款；原只读核对见 `docs/commons-chain-verification.json`。PR #11 已合并，页面可做真实 CSV / GitHub 验收和链上状态查询。队友 B 的 GitHub / CSV 共用规格、回执及 CLI 结算路径打包在独立 `hsk-common-v2/`，不改动现有 Demo；它仅完成本地测试，没有新版 GitHub 或 CSV 测试网交易证据。网页签名发送仍关闭。**
 
@@ -157,13 +157,20 @@ HSK 精简版依赖外部 coding worker 或人工完成代码交付。main 静�
 
 ### 更新记录
 
+- PR #13 合并冲突修复：将最新 main 合入页面修复分支，保留双方功能与交接记录，仅解决本状态文档的冲突并去重。功能范围未扩大；未发送链上交易、未改动钱包或公网部署。本次本地验证：45 项 core 测试、14 项 CSV 测试、前端 JavaScript 语法检查和 git diff 检查通过；只读审查未发现合并阻断问题。未重跑公网浏览器或链上交易。下一步由运行服务的队员拉取合并后的 main 并按现有流程重启服务。
+
+- Task Commons 页面收尾：按团队 procurement 页改为深绿侧栏、浅灰背景、紧凑两栏和案例表格；发布新任务、交易与 JSON 明细按需展开。公网部署已更新，原有登录与发送关闭设置保持不变。已导入队友提供的公开 job 1 / 2 / 3 本地绑定记录；没有覆盖已有记录。
+- 修正已完成任务仍可点提交的问题：界面只允许 Open 接单、Accepted 提交、Submitted 结算；更换任务 ID 清除旧状态。Completed / Refunded 显示原因，独立 PR 验收仍可用。验收成功不再标为“未付款”，链上 Completed 状态不会被验收状态覆盖。CLI 与合约状态检查保持原样；没有回退链上任务或发送交易。
+- 验证：公网 Edge 实测三个任务状态、PR #10 验收、CSV 正确/篡改输出及手机宽度；独立浏览器回归覆盖七种任务状态、重复提交拦截、任务 ID 切换和交易折叠区。下一步由团队审核此分支；钱包配置、网页完整交易、定价/worker 事件与验收策略缺口仍待对应负责人处理。英文路演 PPT 已另行交付为 8 页简化版，不改变产品功能状态。
+
+- Abel（队友 A）13:20：把 job 1 / 2 / 3 的 CLI 本地记录（`hsk-core/.data/jobs/*.json`，只含公开的 spec、tx、PR、SHA，**不含私钥**）复制到 `docs/job-records/`。原因：公网 Task Commons 在 job 3 按「预览提交结果哈希」回报「本地找不到任务 3 的 GitHub 绑定记录」，托管网页的电脑缺这些文件。**托管者请把 `docs/job-records/*.json` 复制到自己 `hsk-core/.data/jobs/`**。另：job 2 退款（reclaim + 提现）与 job 3 第二次闭环已完成，证据见 `docs/e2e-evidence.md`（`68098a5`）；上方第五节「job 2 仍为进行中」已过时。功能代码无变化。
+
 - 队友 B 通用框架 PR（隔离包，未部署）：`hsk-common-v2/` 含 v2 TaskSpec、两类 VerificationReceipt、v2 结果承诺、GitHub / CSV CLI 提交和复验结算，以及 Node/pnpm 锁文件、Dockerfile、配置模板和验收器源码。原 `hsk-core/` 与 Task Commons Demo 的跟踪文件未修改。独立包 48/48 项测试通过，三个合约用 solc 0.8.24 本地编译通过；Docker 守护进程未运行，镜像构建未验证。新版任务还没有测试网交易证据。队友 B 负责交付包与验收说明，测试钱包联调由持钱包队员执行。
 - 本分支已包含合并提交 `876b2a4`（PR #11）及队友 A 的后续更新；原文中“PR #11 未合并”的描述已修正。原 PR 测试和公网演示结论沿用其提交记录，本次没有重跑公网交易。
 - Abel（队友 A）13:28：留言板新增 `Agents chat/20260926-1328-Abel-A-demo-runbook.md`，给托管 Task Commons 的队友：更新步骤（补 job 记录、重启）、CSP 注意事项、6 项已验证可跑通的操作与输入、demo 时不要按的按钮。功能状态无变化。
 
 - Abel（队友 A）13:30（13:27 修正：服务器 CSP 为 `script-src 'self'`，内联脚本被拦截导致按钮无反应；已拆成 `demo.js` / `demo.css` 并加入白名单）：新增只读简化演示页 `hsk-core/web/commons/demo.html`，路径 `/demo`（`scripts/commons.mjs` 白名单加一行）。三张卡片：链上任务状态、GitHub 真实验收（PR → SHA → verify）、CSV 验收（正确 / 删一列）。只调用已有 API，无交易按钮、无新验收逻辑。验证：本地 `http://127.0.0.1:4174/demo` 返回 200；job 3 = Completed；PR #10 verify 四项全通过且 resultHash = `0x3cd7ccb5…4f07`（与链上一致）；CSV 正确输出通过、删一列触发规则 2、4 失败；错误 SHA 被拒；hsk-core 45/45 测试通过。托管者需重启服务才会出现 `/demo`。
 
-- Abel（队友 A）13:20：把 job 1 / 2 / 3 的 CLI 本地记录（`hsk-core/.data/jobs/*.json`，只含公开的 spec、tx、PR、SHA，**不含私钥**）复制到 `docs/job-records/`。原因：公网 Task Commons 在 job 3 按「预览提交结果哈希」回报「本地找不到任务 3 的 GitHub 绑定记录」，托管网页的电脑缺这些文件。**托管者请把 `docs/job-records/*.json` 复制到自己 `hsk-core/.data/jobs/`**。另：job 2 退款（reclaim + 提现）与 job 3 第二次闭环已完成，证据见 `docs/e2e-evidence.md`（`68098a5`）；上方第五节「job 2 仍为进行中」已过时。功能代码无变化。
 - PR #11 跟进 `68098a5`：新增 Task Commons 真实模块适配、公网部署与三个链上案例入口；45 项 core + 14 项 CSV 测试通过，Edge 验证真实 GitHub / CSV。只读复核 16 笔回执与提现转账，记录在 `docs/commons-chain-verification.json`。后续：运行者保持公网服务、团队审查合并 PR，联调队员配置测试钱包完成网页交易；定价 / 执行事件、三个验收缺口仍由对应模块负责人补齐。
 - 公网浏览器实测：未登录请求返回 401；登录后 Job 1 / 2 / 3 实时查询、PR #10 真实验收、CSV 正确输出与篡改拒绝均通过，手机宽度无横向溢出、无页面脚本错误。此验证未发送交易。
 - 本次文档 PR：新增完成状态与剩余工作总览，纳入 `fc1b0bd` 的 job 1 成功闭环证据；增加 README 必读入口与每次任务同步规则。未修改业务代码，功能状态无变化。证据来源：`docs/e2e-evidence.md`；该快照中的 job 2 退款仍为进行中。
