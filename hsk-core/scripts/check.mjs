@@ -24,7 +24,7 @@ export async function runCheck({ env = process.env, args = process.argv.slice(2)
     console.log('Signing keys are needed only for each role; never print or commit them.')
     if (args.includes('--rpc')) {
       await context(undefined, { contracts: !missing.some(key => key.endsWith('_ADDRESS')) })
-      console.log('HSK testnet RPC check passed (read-only)')
+      console.log(missing.some(key => key.endsWith('_ADDRESS')) ? 'HSK testnet RPC passed; contract checks skipped (missing addresses)' : 'HSK testnet RPC and contract checks passed (read-only)')
     }
     return missing.length ? 1 : 0
   } catch (error) {
