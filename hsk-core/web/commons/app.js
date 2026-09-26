@@ -55,6 +55,10 @@ function setScenario(value){
   $('pipeline').hidden=value==='csv';
 }
 $('scenario-code').onclick=()=>setScenario('code');$('scenario-csv').onclick=()=>setScenario('csv');
+for(const button of document.querySelectorAll('[data-evidence-job]')) button.onclick=()=>{
+  if(busy)return;setScenario('code');
+  operation(async()=>{jobStatus=null;$('job-id').value=button.dataset.evidenceJob;$('pr-number').value=button.dataset.pr||'';$('submitted-sha').value=button.dataset.sha||'';invalidate();await loadJob();});
+};
 $('refresh').onclick=()=>operation(refresh);$('load-job').onclick=()=>operation(loadJob);
 $('job-select').onchange=()=>operation(async()=>{const job=jobs.find(job=>String(job.jobId)===$('job-select').value);if(!job)return;$('job-id').value=job.jobId;$('pr-number').value=job.pr||'';$('submitted-sha').value=job.sha||'';invalidate();await loadJob();});
 for(const id of ['pr-number','submitted-sha','job-id'])$(id).addEventListener('input',invalidate);

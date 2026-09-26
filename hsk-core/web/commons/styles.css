@@ -5,3 +5,5 @@
 td{overflow-wrap:anywhere;max-width:360px} .pipeline{font-size:12px}
 
 #result,#transaction-plan{background:#132d34;color:#dff2eb}
+.case-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.case-grid article{background:#f2f7f6;padding:14px;border-radius:7px}.case-grid p{font-size:13px;margin:8px 0}.case-grid a{font-size:12px;color:var(--green)}.case-grid button{display:block;margin-top:12px;width:100%}#team-evidence>.hint{margin-top:12px}@media(max-width:700px){.case-grid{grid-template-columns:1fr}#team-evidence .panel-title{display:block}#team-evidence .panel-title>a{display:inline-block;margin-top:10px}}
+.evidence th:first-child,.evidence td:first-child{width:35%;min-width:100px}.evidence td:last-child{white-space:normal;overflow-wrap:anywhere}

@@ -57,4 +57,4 @@ COMMONS_PUBLIC_ORIGIN=https://your-current-tunnel.trycloudflare.com
 
 如果 CLI 报告回执未知或发送超时，本服务会写 `.data/commons-pending.json` 并阻止进一步发送。运行者须先核对其中的交易回执和任务状态，确认后才移除该标记。不要未经核对重复发送。
 
-测试使用隔离的模拟 GitHub/API/CLI 与临时目录，不使用测试钱包。实际链上完整运行仍需组员配置后验证。Task Commons 复用现有验收与合约的信任边界，不新增“链上自动验证 GitHub”的声明。
+测试使用隔离的模拟 GitHub/API/CLI 与临时目录，不使用测试钱包。队友已通过 CLI 完成 job 1、3 付款和 job 2 退款；只读复核快照见 `../docs/commons-chain-verification.json`。网页新增三个真实案例的交易链接和实时状态查询，不把历史 CLI 交易标成网页发起。通过网页的完整交易仍需组员配置后验证。Task Commons 复用现有验收与合约的信任边界，不新增“链上自动验证 GitHub”的声明。
