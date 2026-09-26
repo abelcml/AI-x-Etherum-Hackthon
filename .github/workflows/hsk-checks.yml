@@ -1,0 +1,30 @@
+name: HSK core checks
+on:
+  push:
+    branches: [main, handsel-hsk-implementation]
+    paths: ['hsk-core/**', '.github/workflows/hsk-checks.yml']
+  pull_request:
+    paths: ['hsk-core/**', '.github/workflows/hsk-checks.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  hsk-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: hsk-core
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: hsk-core/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm compile
