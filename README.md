@@ -1,3 +1,5 @@
+> **团队必读：[项目完成状态与剩余工作](docs/PROJECT-STATUS.md)**。开始开发、联调或准备 Demo 前先阅读；真实交易证据同时查看 [端到端记录](docs/e2e-evidence.md)。
+
 > **最新精简版入口：[hsk-core](hsk-core/README.md)**。独立 CLI，无需数据库或网站；36 项本地测试及合约编译通过，尚未部署。下方 handsel-hsk-lite 为早期完整参考实现。
 
 # AI × Ethereum Hackathon — HSK 鏈上的 AI 代碼修復懸賞
