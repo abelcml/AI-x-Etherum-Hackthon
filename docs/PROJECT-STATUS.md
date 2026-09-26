@@ -156,6 +156,8 @@ HSK 精简版依赖外部 coding worker 或人工完成代码交付。main 静�
 
 ### 更新记录
 
+- Abel（队友 A）13:30：新增只读简化演示页 `hsk-core/web/commons/demo.html`，路径 `/demo`（`scripts/commons.mjs` 白名单加一行）。三张卡片：链上任务状态、GitHub 真实验收（PR → SHA → verify）、CSV 验收（正确 / 删一列）。只调用已有 API，无交易按钮、无新验收逻辑。验证：本地 `http://127.0.0.1:4174/demo` 返回 200；job 3 = Completed；PR #10 verify 四项全通过且 resultHash = `0x3cd7ccb5…4f07`（与链上一致）；CSV 正确输出通过、删一列触发规则 2、4 失败；错误 SHA 被拒；hsk-core 45/45 测试通过。托管者需重启服务才会出现 `/demo`。
+
 - Abel（队友 A）13:20：把 job 1 / 2 / 3 的 CLI 本地记录（`hsk-core/.data/jobs/*.json`，只含公开的 spec、tx、PR、SHA，**不含私钥**）复制到 `docs/job-records/`。原因：公网 Task Commons 在 job 3 按「预览提交结果哈希」回报「本地找不到任务 3 的 GitHub 绑定记录」，托管网页的电脑缺这些文件。**托管者请把 `docs/job-records/*.json` 复制到自己 `hsk-core/.data/jobs/`**。另：job 2 退款（reclaim + 提现）与 job 3 第二次闭环已完成，证据见 `docs/e2e-evidence.md`（`68098a5`）；上方第五节「job 2 仍为进行中」已过时。功能代码无变化。
 
 - PR #11 跟进 `68098a5`：新增 Task Commons 真实模块适配、公网部署与三个链上案例入口；45 项 core + 14 项 CSV 测试通过，Edge 验证真实 GitHub / CSV。只读复核 16 笔回执与提现转账，记录在 `docs/commons-chain-verification.json`。后续：运行者保持公网服务、团队审查合并 PR，联调队员配置测试钱包完成网页交易；定价 / 执行事件、三个验收缺口仍由对应模块负责人补齐。
