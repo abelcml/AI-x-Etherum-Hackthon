@@ -34,15 +34,41 @@
 - 鏈上 `resultHash` = `0xfcae1062…48be`。用 PR #7 的 head SHA 重算 `keccak(["handsel-hsk-pr-v1", "abelcml/ai-x-etherum-hackthon", 7, "959d86d0…"])` 得到**相同的值**，所以鏈上記錄可以對回被合併的那個 commit。
 - MockUSDC 錢包餘額：worker 從 10 → **12**（+2 賞金）；requester 從 10 → **7**（−2 給 job 1、−1 鎖在 job 2）。
 
-## job 2：退款路徑（進行中）
+## job 2：退款路徑（逾期未交件 → 退款）
 
-- 12:45 發布 1 tUSDC 並接單，交付期限 600 秒，worker 故意不交件。
-- 發布 tx [`0xabb94f05…`](https://testnet-explorer.hskchain.net/tx/0xabb94f051e55c30420a0398d709e211bea32f273b2c15e34e01c03741c2317e0)，接單 tx [`0xc0178178…`](https://testnet-explorer.hskchain.net/tx/0xc0178178d6d2539540657ffe9d898db33fcb25c886621d9df7a46c40a8a6de58)。
-- 12:55 之後執行 `reclaim`，1 tUSDC 退回 requester。結果補在這裡。
+| # | 步驟 | 證據 |
+|---|---|---|
+| 1 | 12:45 發布 1 tUSDC，交付期限 600 秒 | [`0xabb94f05…`](https://testnet-explorer.hskchain.net/tx/0xabb94f051e55c30420a0398d709e211bea32f273b2c15e34e01c03741c2317e0) |
+| 2 | worker 接單，但故意不交件 | [`0xc0178178…`](https://testnet-explorer.hskchain.net/tx/0xc0178178d6d2539540657ffe9d898db33fcb25c886621d9df7a46c40a8a6de58) |
+| 3 | 12:55 期限過後 `reclaimJob`，狀態變成 `Refunded` | [`0x2935e356…`](https://testnet-explorer.hskchain.net/tx/0x2935e3565072550fbd039831570c0ba050eb54ce2114f8714a851ac18f27be1c) |
+| 4 | requester 提現退款 | [`0x755530ce…`](https://testnet-explorer.hskchain.net/tx/0x755530ce182f5c2f270d6f1539ce00f4a1dcf35b1bf57183c2ff82fe414df01a) |
+
+## job 3：第二次成功閉環（Abel 親手操作 GitHub）
+
+Abel 自己開 issue、在網頁上改檔案、開 PR、merge；鏈上步驟由 CLI 執行。
+
+| # | 步驟 | 證據 |
+|---|---|---|
+| 1 | Issue | [#9](https://github.com/abelcml/AI-x-Etherum-Hackthon/issues/9) |
+| 2 | 發布 2 tUSDC | [`0x050a3786…`](https://testnet-explorer.hskchain.net/tx/0x050a37867a5e3f2f442f2bdeb42cbc50f652fad3ac79b0ec4ecf08f16e6d55a0) |
+| 3 | 接單 | [`0x87a822de…`](https://testnet-explorer.hskchain.net/tx/0x87a822de54d6e9a43a0a0e4917f862d979863ceef272819c8d46ca3cff01992b) |
+| 4 | PR + CI + 人工 merge | [PR #10](https://github.com/abelcml/AI-x-Etherum-Hackthon/pull/10)，head SHA `e3a7b19f2809df247535aaf06062deb684763f73`，`hsk-checks` pass |
+| 5 | 提交結果 | [`0xffdefd2e…`](https://testnet-explorer.hskchain.net/tx/0xffdefd2e3eda6fbe6758b950916655efbde037b5d5779c9b5e4f45f13c84853b)，`resultHash` `0x3cd7ccb5…4f07` |
+| 6 | 結算 | [`0x39ba44ac…`](https://testnet-explorer.hskchain.net/tx/0x39ba44acd76b95f9810fadcbb02e24f6205140b8336ef65992ae4c1cc60ae22b) |
+| 7 | worker 提現 | [`0xa4f8875d…`](https://testnet-explorer.hskchain.net/tx/0xa4f8875db4ada38f375205533739ae4f568574e0323fec5f0bdb19bc16fd6a78) |
+
+## 最終餘額（讀 MockUSDC 合約）
+
+| | 起始 | job 1 | job 2 | job 3 | 最終 |
+|---|---|---|---|---|---|
+| requester | 10 | −2 | −1 +1（退款） | −2 | **6** |
+| worker | 10 | +2 | 0 | +2 | **14** |
+
+合約內兩者可領取餘額皆為 0。
 
 ## 已知限制（這次閉環沒有擋、也沒測到）
 
 - PR 沒有綁到 issue 或 job：CLI 不檢查 PR 是否對應 Issue #6（見 `Agents chat/20260926-1200-...`）。
 - 沒有「禁止修改測試 / CI 檔案」的檢查。
 - 結算是 requester 自己執行 CLI，屬於託管模式；合約只相信 requester 的 `approveJob`。
-- 兩次 `post` 的第一次嘗試都因 `TransferFailed` 失敗，重試就成功。推測是 approve 之後 RPC 讀到的狀態還沒更新（未證實）。
+- 兩次 `post` 的第一次嘗試都因 `TransferFailed` 失敗，重試就成功。推測是 approve 之後 RPC 讀到的狀態還沒更新。旁證：requester 提現交易 receipt 已是 success 後，緊接著讀餘額仍是舊值，稍後再讀才正確。
