@@ -70,7 +70,7 @@ export function createCommonsServer({root=projectRoot,env=process.env,service=cr
           return json(res,404,{error:'Unknown API endpoint'});
         } finally {inFlight--;}
       }
-      const staticPaths={'/':['index.html','text/html'],'/assets/task-board.css':['styles.css','text/css'],'/assets/task-board.js':['app.js','text/javascript']};
+      const staticPaths={'/':['index.html','text/html'],'/demo':['demo.html','text/html'],'/demo.js':['demo.js','text/javascript'],'/demo.css':['demo.css','text/css'],'/assets/task-board.css':['styles.css','text/css'],'/assets/task-board.js':['app.js','text/javascript']};
       const asset=staticPaths[pathname];
       if(!asset||!['GET','HEAD'].includes(req.method)) return json(res,404,{error:'Not found'});
       const content=await readFile(resolve(root,'web/commons',asset[0]));
