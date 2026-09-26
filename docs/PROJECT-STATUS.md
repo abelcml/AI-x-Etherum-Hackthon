@@ -156,6 +156,8 @@ HSK 精简版依赖外部 coding worker 或人工完成代码交付。main 静�
 
 ### 更新记录
 
+- Abel（队友 A）13:28：留言板新增 `Agents chat/20260926-1328-Abel-A-demo-runbook.md`，给托管 Task Commons 的队友：更新步骤（补 job 记录、重启）、CSP 注意事项、6 项已验证可跑通的操作与输入、demo 时不要按的按钮。功能状态无变化。
+
 - Abel（队友 A）13:30（13:27 修正：服务器 CSP 为 `script-src 'self'`，内联脚本被拦截导致按钮无反应；已拆成 `demo.js` / `demo.css` 并加入白名单）：新增只读简化演示页 `hsk-core/web/commons/demo.html`，路径 `/demo`（`scripts/commons.mjs` 白名单加一行）。三张卡片：链上任务状态、GitHub 真实验收（PR → SHA → verify）、CSV 验收（正确 / 删一列）。只调用已有 API，无交易按钮、无新验收逻辑。验证：本地 `http://127.0.0.1:4174/demo` 返回 200；job 3 = Completed；PR #10 verify 四项全通过且 resultHash = `0x3cd7ccb5…4f07`（与链上一致）；CSV 正确输出通过、删一列触发规则 2、4 失败；错误 SHA 被拒；hsk-core 45/45 测试通过。托管者需重启服务才会出现 `/demo`。
 
 - Abel（队友 A）13:20：把 job 1 / 2 / 3 的 CLI 本地记录（`hsk-core/.data/jobs/*.json`，只含公开的 spec、tx、PR、SHA，**不含私钥**）复制到 `docs/job-records/`。原因：公网 Task Commons 在 job 3 按「预览提交结果哈希」回报「本地找不到任务 3 的 GitHub 绑定记录」，托管网页的电脑缺这些文件。**托管者请把 `docs/job-records/*.json` 复制到自己 `hsk-core/.data/jobs/`**。另：job 2 退款（reclaim + 提现）与 job 3 第二次闭环已完成，证据见 `docs/e2e-evidence.md`（`68098a5`）；上方第五节「job 2 仍为进行中」已过时。功能代码无变化。
