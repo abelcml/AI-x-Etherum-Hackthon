@@ -1,0 +1,9 @@
+id,name,city
+1,Alice,Sydney
+2,Bob,Melbourne
+1,Alice Dup,Perth
+3,Carol,Brisbane
+2,Bob Dup,Hobart
+4,Dave,Adelaide
+3,Carol Dup,Darwin
+5,Eve,Canberra

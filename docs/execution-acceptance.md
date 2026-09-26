@@ -1,57 +1,36 @@
-# 執行與驗收（原隊友 B 範圍，由 A 一併負責）
+# 执行、验收与结算（队友 B）
 
-接在 `docs/task-labels.md` 之後：任務發布後，誰執行、交什麼、怎麼判定完成、交給結算什麼。
+任务定义见 `docs/task-labels.md`。新版通用流程位于独立的 `hsk-common-v2/`，不修改现有 `hsk-core/` 或 Task Commons Demo。以下区分旧版真实链上案例与新版本地实现。
 
-## 1. 兩個場景的現況
+## 共用流程
 
-| 場景 | 執行器 | 驗收器 | 狀態 |
-|---|---|---|---|
-| 代碼修復 | 外部 coding worker 開 PR | `hsk-core/src/github.mjs` `verifyMergedPr`：PR 已 merge、head SHA 等於預期、指定 App 的必需檢查全部 success | ph1gros 已實作（分支 `handsel-hsk-implementation`，PR #2 未 merge），自述 33 項本地測試通過，未上鏈 |
-| CSV 去重 | `acceptance/csv-dedupe/cli.mjs run`（參考執行器，代表 AI worker 的正確答案） | `acceptance/csv-dedupe/cli.mjs verify` | 本地 8 項測試通過；**未接鏈上結算** |
-
-## 2. 結果欄位表（worker 交件時提供）
-
-| 欄位 | 代碼修復 | CSV 去重 |
-|---|---|---|
-| 任務編號 | 是 | 是 |
-| 運行編號 | 一次嘗試一個 | 同左 |
-| 產物 | PR 編號 | 輸出 CSV 連結 |
-| 產物版本 | PR head SHA（40 碼） | 輸出 CSV 的 sha256（標準化後，見第 4 節） |
-| 鏈上 `resultHash` | `keccak(["handsel-hsk-pr-v1", repo, pr, headSha])`（`hsk-core/src/proof.mjs`） | 建議：`keccak(["handsel-hsk-csv-v1", taskId, outputSha256])`（**未實作**） |
-
-## 3. 驗收欄位表（驗收器輸出）
-
-| 欄位 | 說明 |
-|---|---|
-| 任務編號 / 產物版本 | 驗的是哪一個版本 |
-| 結果 | 通過 / 失敗 / 待確認（例：CI 尚未跑完） |
-| 失敗原因 | 列出違反哪幾條規則 |
-| 證據 | 代碼修復：check-run id 與連結；CSV：`outputSha256` 與預期 hash |
-| 驗收者 | 哪個程式 / 哪把錢包執行 |
-
-**驗收結果只是事實，不直接動錢。** 結算由持 requester 錢包的一方依結果呼叫合約，這是託管模式，pitch 時照實說。
-
-## 4. CSV 驗收的四條規則（實作於 `acceptance/csv-dedupe/csv-dedupe.mjs`）
-
-1. 表頭與輸入相同
-2. 輸出 id 集合 = 輸入 id 集合（擋「只交表頭」和「亂刪列」）
-3. 輸出 id 無重複
-4. 輸出的 sha256 = 發布者事先公布的預期 hash（擋「保留最後一筆」等不同答案）
-
-hash 對「標準化後」的內容計算：LF 換行、結尾一個換行，所以 CRLF 與 LF 判定相同。範圍：逗號分隔、UTF-8、第一列為表頭、**不處理帶引號的欄位**。
-
-範例（`sample.csv`，key = `id`）：
-
-```sh
-cd acceptance/csv-dedupe
-node cli.mjs expected sample.csv id
-# bfe13e8e1f31c746f933354a6f3e33190397c9e664cb896d9db5bcb1fefa0173
-node cli.mjs run sample.csv id out.csv
-node cli.mjs verify sample.csv out.csv id bfe13e8e1f31c746f933354a6f3e33190397c9e664cb896d9db5bcb1fefa0173
-node --test
+```text
+发布 TaskSpec 并封存 specHash → worker 提交 Artifact
+→ 对应适配器生成 VerificationReceipt → worker 提交 resultHash
+→ requester 重新验收同一 Artifact → 确认结算 → worker 提现
 ```
 
-## 5. 尚未解決
+新版 `TaskSpec` 固定 HSK chain、合约、任务类型、输入身份、验收规则、标题、赏金和交付窗口。GitHub 输入为仓库与 Issue，规则包含检查 App ID、必需检查名和禁止修改的路径；CSV 输入为原文件 SHA-256、去重键和预期输出 SHA-256。链上只存 `specHash`，完整规格保存在 `hsk-common-v2/.data/jobs/<jobId>.json`，需要在执行者与验收者之间可靠共享。
 
-- 代碼修復的「禁止修改路徑」（`tests/`、`.github/`）：`verifyMergedPr` 目前沒有檢查 PR 改了哪些檔案。已在留言板建議 ph1gros。
-- CSV 場景的鏈上結算：`resultHash` 格式只是建議，沒有接 `hsk-core` 的 `job submit`。
+两种适配器都返回 `VerificationReceipt`：`version`、`jobId`、`taskType`、`specHash`、`artifact`、`verified`、`evidence`、`resultHash`。失败时抛出错误，不生成通过的回执。回执是本地 JSON 数据，没有独立签名。`resultHash` 使用 `keccak256` 绑定任务编号、规格哈希、类型、GitHub `owner/repo#PR`（CSV 留空）和已验收的成果哈希。旧版任务沿用原有 PR 哈希，已发生的链上交易不受影响。
+
+## GitHub 适配器
+
+外部 coding worker 提交 PR。新版验收器要求 PR 已合并、标题或正文声明关闭该任务 Issue、没有修改 `tests/` 或 `.github/`，且指定 GitHub App 的必需检查在 PR head SHA 上全部成功。`submit` 保存 PR 编号与 SHA；`settle` 再查同一 PR 和 SHA，并核对链上及本地 `resultHash`。Issue 声明只能证明显式引用，无法单独证明代码确实解决了问题。
+
+旧版 job 1 和 job 3 的 PR 付款、job 2 的退款已有真实测试网证据，见 `docs/e2e-evidence.md`。新版规则没有对应的真实链上交易证据。
+
+## CSV 适配器
+
+`acceptance/csv-dedupe` 按指定列保留首条。发布时封存原始输入 SHA-256 和预期输出 SHA-256；提交与结算时重新读文件并要求：
+
+1. 表头与输入相同。
+2. 输出 key 集合等于输入 key 集合。
+3. 输出 key 无重复。
+4. 标准化后的输出 SHA-256 等于预期值。
+
+标准化采用 LF 换行及末尾一个换行。支持 UTF-8、逗号分隔、无引号字段的小型 CSV。独立 CLI 已接 `post --type csv-dedupe`、`submit --output` 和 `settle` 的本地代码路径及测试；还没有真实 CSV 测试网交易，也没有 CSV 网页付款入口。操作命令见 `hsk-common-v2/README.md`。
+
+## 信任边界与剩余工作
+
+链上合约不执行 GitHub 或 CSV 验收，它信任 requester 的 `approveJob`。独立 CLI 会在发送批准交易前重新验收，但 requester 仍可绕过 CLI 直接调用合约。原 Demo 的网页签名发送尚未完成联调，且不会自动使用本包。下一步由持测试钱包的联调队员在隔离环境跑新版 GitHub 与 CSV 真实任务，保存交易和余额证据；如需网页支持，应另行设计集成。完整争议操作尚未接入独立 CLI/UI。
