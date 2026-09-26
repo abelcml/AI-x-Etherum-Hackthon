@@ -16,13 +16,13 @@ MetaMask → 左上網路選單 → Add network → Add a network manually：
 
 | 欄位 | 值 |
 |---|---|
-| Network name | HashKey Chain Testnet |
+| Network name | HSKChain Testnet |
 | RPC URL | https://testnet.hsk.xyz |
 | Chain ID | 133 |
 | Currency symbol | HSK |
-| Block explorer | https://testnet-explorer.hsk.xyz |
+| Block explorer | https://testnet-explorer.hskchain.net |
 
-來源：HashKey 官方 docs、ChainList。explorer 網址取自 `handsel-hsk-lite/lib/onchain/config.ts`，我沒有另外核對。
+來源：chainid.network 登記的 chain 133（名稱 `HSKChain Testnet`、explorer `testnet-explorer.hskchain.net`）。名稱要照登記的填，否則 MetaMask 會警告。`handsel-hsk-lite/lib/onchain/config.ts` 用的 explorer 是 `testnet-explorer.hsk.xyz`，兩者是否都能開沒有核對。
 
 ## 3. 領測試 HSK
 
