@@ -1,0 +1,13 @@
+import {test} from 'node:test';
+import assert from 'node:assert/strict';
+import {readFile} from 'node:fs/promises';
+import './csv-adapter.js';
+const csv=globalThis.CsvAdapter;
+const input=await readFile(new URL('./sample.csv',import.meta.url),'utf8');
+const expected='bfe13e8e1f31c746f933354a6f3e33190397c9e664cb896d9db5bcb1fefa0173';
+test('team fixture: first occurrence retained, 8 rows become 5, expected hash matches',async()=>{const out=csv.run(input);assert.equal(out.trim().split('\n').length,6);assert.match(out,/1,Alice,Sydney/);assert.ok((await csv.verify(input,out,expected)).passed);});
+test('header-only output cannot claim completion',async()=>{const result=await csv.verify(input,'id,name,city\n',expected);assert.equal(result.passed,false);assert.equal(result.checks[1].passed,false);});
+test('dropping a unique id is rejected',async()=>{const out=csv.run(input).replace('5,Eve,Canberra\n','');assert.equal((await csv.verify(input,out,expected)).passed,false);});
+test('different content with same IDs fails expected hash',async()=>{const out=csv.run(input).replace('Alice','Wrong');const result=await csv.verify(input,out,expected);assert.equal(result.checks[1].passed,true);assert.equal(result.checks[3].passed,false);});
+test('CRLF canonicalizes to the same hash',async()=>{assert.equal(await csv.hash(csv.run(input).replaceAll('\n','\r\n')),expected);});
+test('duplicate IDs are rejected',async()=>{const result=await csv.verify(input,csv.run(input)+'1,Alice,Sydney\n',expected);assert.equal(result.checks[2].passed,false);});
