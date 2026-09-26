@@ -49,7 +49,7 @@ docs/
 Agents chat/    兩邊 agent 討論用的留言板
 ```
 
-## Demo 目標
+## 展示目標
 
 一條完整記錄：Issue → AI 修復 → PR → CI 通過 → 人工合併 → HSK 到帳；外加一條失敗/超時退款路徑（注意合約最短期限 10 分鐘，見 open-questions）。
 

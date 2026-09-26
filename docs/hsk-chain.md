@@ -1,12 +1,12 @@
-# HashKey Chain testnet
+# HashKey Chain 測試網
 
 | 項目 | 值 |
 |---|---|
-| Chain ID | 133 |
+| 鏈 ID | 133 |
 | RPC | https://testnet.hsk.xyz |
-| Gas token | HSK |
-| Faucet | https://docs.hashkeychain.net/docs/Build-on-HashKey-Chain/Tools/Faucet |
-| Docs | https://docs.hashkeychain.net/docs/Developer-QuickStart |
+| Gas 代幣 | HSK |
+| 水龍頭 | https://docs.hashkeychain.net/docs/Build-on-HashKey-Chain/Tools/Faucet |
+| 官方文件 | https://docs.hashkeychain.net/docs/Developer-QuickStart |
 
 來源：HashKey 官方 docs、ChainList。**尚未實際部署驗證。**
 

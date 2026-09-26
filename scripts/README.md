@@ -1,6 +1,6 @@
-# scripts
+# 腳本
 
-## settler（尚未實作，邏輯待確認）
+## 結算器 settler（尚未實作，邏輯待確認）
 
 用輪詢取代 Handsel 的 GitHub App + webhook，省掉公開 URL 與資料庫。草案：
 

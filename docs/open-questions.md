@@ -2,7 +2,7 @@
 
 每項格式：事實 → 推論 → 建議。**決定後請在該項下寫「決定：…（誰，時間）」。**
 
-## Blocking
+## 阻斷級（不解決 demo 會卡住）
 
 ### B1. 誰是 requester？「普通錢包模式」vs「平台觸發付款」
 - 事實：`LaborMarketV2.approveJob()` 有 `if (msg.sender != job.requester) revert NotRequester();`
@@ -15,7 +15,7 @@
 - 建議：demo 前 ≥10 分鐘預先開一個「已 accept 未交件」的 job，上台直接 `reclaimJob`；或演 `cancelJob`（Open 狀態可立即退）。
 - 決定：
 
-## Important
+## 重要（影響評審解讀）
 
 ### I1. 新意要主動講
 - Handsel README 的主 demo 就是本流程。差異 = HSK 部署 + same-SHA 規則（見 handsel-review.md #1）。Pitch 第一句就講。
@@ -35,6 +35,6 @@
 - 建議：用輪詢 script 取代 webhook（見 scripts/README.md）。
 - 決定：
 
-## Minor
+## 次要
 - HSK track 是否硬性要求部署在 HashKey Chain、評分標準：Luma 頁面沒寫，需現場問主辦。
 - 私有 repo 能否作為提交：未查。
