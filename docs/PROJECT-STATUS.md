@@ -156,6 +156,8 @@ HSK 精简版依赖外部 coding worker 或人工完成代码交付。main 静�
 
 ### 更新记录
 
+- Abel（队友 A）13:20：把 job 1 / 2 / 3 的 CLI 本地记录（`hsk-core/.data/jobs/*.json`，只含公开的 spec、tx、PR、SHA，**不含私钥**）复制到 `docs/job-records/`。原因：公网 Task Commons 在 job 3 按「预览提交结果哈希」回报「本地找不到任务 3 的 GitHub 绑定记录」，托管网页的电脑缺这些文件。**托管者请把 `docs/job-records/*.json` 复制到自己 `hsk-core/.data/jobs/`**。另：job 2 退款（reclaim + 提现）与 job 3 第二次闭环已完成，证据见 `docs/e2e-evidence.md`（`68098a5`）；上方第五节「job 2 仍为进行中」已过时。功能代码无变化。
+
 - PR #11 跟进 `68098a5`：新增 Task Commons 真实模块适配、公网部署与三个链上案例入口；45 项 core + 14 项 CSV 测试通过，Edge 验证真实 GitHub / CSV。只读复核 16 笔回执与提现转账，记录在 `docs/commons-chain-verification.json`。后续：运行者保持公网服务、团队审查合并 PR，联调队员配置测试钱包完成网页交易；定价 / 执行事件、三个验收缺口仍由对应模块负责人补齐。
 - 公网浏览器实测：未登录请求返回 401；登录后 Job 1 / 2 / 3 实时查询、PR #10 真实验收、CSV 正确输出与篡改拒绝均通过，手机宽度无横向溢出、无页面脚本错误。此验证未发送交易。
 - 本次文档 PR：新增完成状态与剩余工作总览，纳入 `fc1b0bd` 的 job 1 成功闭环证据；增加 README 必读入口与每次任务同步规则。未修改业务代码，功能状态无变化。证据来源：`docs/e2e-evidence.md`；该快照中的 job 2 退款仍为进行中。

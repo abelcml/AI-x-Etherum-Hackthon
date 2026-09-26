@@ -1,0 +1,17 @@
+{
+  "jobId": "2",
+  "spec": {
+    "version": 1,
+    "chainId": 133,
+    "market": "0xf7400c17e0b48ac3166efead6b349959b54a58a9",
+    "repo": "abelcml/ai-x-etherum-hackthon",
+    "issue": 6,
+    "title": "退款路徑示範：接單後逾期未交件",
+    "bounty": "1000000",
+    "window": 600
+  },
+  "specHash": "0x87b3bbeb1ab1569ad092ee51143edfa2c4e51ad6a4e8ea0e97989d3bed601331",
+  "postedTx": "0xabb94f051e55c30420a0398d709e211bea32f273b2c15e34e01c03741c2317e0",
+  "prNumber": null,
+  "headSha": null
+}

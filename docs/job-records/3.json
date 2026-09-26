@@ -1,0 +1,19 @@
+{
+  "jobId": "3",
+  "spec": {
+    "version": 1,
+    "chainId": 133,
+    "market": "0xf7400c17e0b48ac3166efead6b349959b54a58a9",
+    "repo": "abelcml/ai-x-etherum-hackthon",
+    "issue": 9,
+    "title": "hsk-core README 狀態過時：已部署並跑通閉環",
+    "bounty": "2000000",
+    "window": 1800
+  },
+  "specHash": "0xe72e6d58c4bfac8b5169ba3accd3d418f43c482b7ce3a1947ab024e95a72883f",
+  "postedTx": "0x050a37867a5e3f2f442f2bdeb42cbc50f652fad3ac79b0ec4ecf08f16e6d55a0",
+  "prNumber": 10,
+  "headSha": "e3a7b19f2809df247535aaf06062deb684763f73",
+  "resultHash": "0x3cd7ccb5c31b3426596a6d16466756e3d25d47a0f878168597f389454d644f07",
+  "submittedTx": "0xffdefd2e3eda6fbe6758b950916655efbde037b5d5779c9b5e4f45f13c84853b"
+}
