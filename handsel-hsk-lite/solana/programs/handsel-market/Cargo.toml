@@ -1,0 +1,23 @@
+[package]
+name = "handsel-market"
+version = "0.1.0"
+edition = "2021"
+# The SBF toolchain bundles its own rustc, older than any host. Declaring it
+# here is what makes resolver 3 pick versions that toolchain can actually read.
+rust-version = "1.79"
+description = "Handsel escrow core on Solana — devnet port of LaborMarketV2"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "handsel_market"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = { version = "0.31", features = ["init-if-needed"] }
+anchor-spl = "0.31"

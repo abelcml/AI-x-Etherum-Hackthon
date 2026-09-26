@@ -1,0 +1,527 @@
+# Base mainnet, kernel mode — the ordered runbook
+
+`docs/mainnet-deploy.md` is the reasoning: what can cost you money, why the fee is
+shaped the way it is, how the two gas layers must be ordered. Read it once —
+noting that its arbiter/oracle guidance is superseded by §2.5 below (they must
+be the SAME address in the current code). The mainnet-vs-testnet split lives
+in `docs/deployments.md`.
+
+This is the sequence, in order, with the reason each step comes where it does.
+Every value here was verified rather than recalled; where something was read off a
+chain or out of the code, it says so.
+
+## Why a new deployment, not a repoint
+
+Three deployments end up existing, and that is correct:
+
+| | chain | role |
+|---|---|---|
+| `ai-agent-credit-dashboard` (v1) | Ethereum Sepolia | V1-contract archive |
+| `handsel-nu` | Base Sepolia | testnet, permanently |
+| **new** | Base mainnet | the real market |
+
+**Not v1's code.** Checked: v1 has no `contracts/src/LaborMarketV2.sol`, no
+`lib/onchain/labor-v2.ts`, no custom-error decoding, no market clock, no wired
+mainnet guard. Deploying mainnet from it would re-ship every defect fixed since.
+
+**Not `handsel-nu`'s database.** The credit score is the product's claim, and on
+Base Sepolia it was earned with free tokens — `creditScore 670`, `creditLimit
+60000`, both verified on chain. A mainnet inheriting that DB would let the first
+agent borrow real money against a limit earned for free, which is the
+self-Sybil problem in `docs/self-sybil-attack.md` arriving on day one. Mainnet
+starts at a genuine cold start, the way the testnet requester still reads
+`score 0, limit 0`.
+
+**Not `handsel-nu` itself.** Kernel mode had executed zero times when this was
+written; mainnet job #1 (2026-07-30) was its first full run. Repointing the
+only testnet would have left nowhere to find that out.
+
+## New secrets, and why the owner key especially
+
+```
+DATABASE_URL                 new Neon project
+AGENT_OWNER_PRIVATE_KEY      NEW — see below
+ORACLE_PRIVATE_KEY           new (same value as owner if keeping one key)
+API_KEY_ENCRYPTION_SECRET    new; must differ per deployment, it decrypts that
+                             deployment's own DB. Set once, never rotated.
+```
+
+The owner key matters most. Agent addresses derive from it, so reusing the
+testnet key would give the same `agentId` the same address on both chains — and a
+testnet key is handled loosely by definition. A leak there would then be a
+mainnet loss. This is a bigger separation than the arbiter, whose authority is
+bounded to misdirecting a *disputed* job's escrow between worker and requester
+(read from `resolveDispute`: it cannot pay itself).
+
+## 1. ZeroDev, mainnet project
+
+Separate project from the testnet one. Never reuse.
+
+The project for this deployment exists. Its paymaster is
+`0xEB49a384cCeAA47238d97cb1Dc5629e3f624e4d3`, and reading it on Base mainnet
+rather than taking it on trust:
+
+| read | value |
+|---|---|
+| bytecode at that address, chain 8453 | 4422 bytes — a `VerifyingPaymaster` |
+| `entryPoint()` | `0x0000000071727De22E5E9d8BAf0edAc6f37da032` (v0.7) |
+| `owner()` = `verifyingSigner()` | `0xEcbC06bD5E6EceBed60196E469b7559fFC584479` — ZeroDev's, not ours |
+| `getDepositInfo(pm).deposit` at the EntryPoint | **0** |
+| same address on Base Sepolia | no contract |
+
+**Mainnet-only, and the $10 is not an on-chain deposit — and it is not reaching
+the paymaster either.** The deposit above reads zero, and asking the project to
+sponsor a real operation returns `AA21 didn't pay prefund` from
+`pm_getPaymasterStubData`. An operation that names a paymaster makes the
+PAYMASTER owe the EntryPoint's prefund, so a deposit of zero fails precisely
+there.
+
+The chain read alone was written off here as ambiguous — a provider might fund
+the deposit just in time, and an empty deposit looks the same either way. It was
+not ambiguous; it was correct, and the sponsorship attempt is what showed it. A
+balance in a dashboard is an accounting entry. `getDepositInfo(pm).deposit` is
+whether anything can actually be paid.
+
+**Sponsorship does not work on this project today.** That does not block steps 2
+through 6: contracts are deployed by an EOA paying its own gas, and the paymaster
+is not involved until agents transact. Take it up with ZeroDev — whether the
+sandbox balance covers mainnet at all, and what funds the paymaster's deposit —
+while the rest proceeds.
+
+**What a UserOp costs**, measured at block 49316999 (base fee 0.005 gwei;
+ETH/USD 1916.07 from the Chainlink feed on Base) rather than estimated:
+
+| gas | ETH | USD |
+|---|---|---|
+| 300k | 0.0000018 | $0.0035 |
+| 500k | 0.0000030 | **$0.0058** |
+| 800k | 0.0000048 | $0.0092 |
+
+L2 execution only — Base's L1 data fee is extra, small enough post-blobs that the
+honest figure comes off the first real receipt. At 500k gas the grant is about
+**1,700 operations**, or ~300 full job cycles at five to six ops each.
+
+So $10 is not tight. What is wrong is the shape of the app's budget, not its
+size. **Everything in this table describes the day sponsorship is turned ON;
+the live mainnet config is `PAYMASTER_DISABLED=true` and none of it is in
+force today:**
+
+| setting | value | why |
+|---|---|---|
+| `SPONSOR_GRANT_TOTAL_USD` | **8** | the axis the app was missing — every other budget is a 24h window, and a window cannot see a total. $5 + $2 a day is ~1,200 ops, so two days empties a grant nobody refills. $2 of headroom against ZeroDev's own accounting |
+| `USER_LANE_GAS_BUDGET_USD` | **0.50** | ~87 ops/day, ~14 user-side job cycles — fourteen days of runway at full burn |
+| `KEEPER_LANE_GAS_BUDGET_USD` | **0.20** | ~35 ops/day against a sweep bounded at 6 calls a pass |
+| ZeroDev daily cap | **0.001 ETH** | ≈$1.9 at $1,916/ETH, about 200 operations — above the app's ~120, so the app degrades first. **The field is denominated in ETH, not dollars.** Entering `1` there is not a dollar; it is roughly two thousand of them |
+| per-sender rate | 300/day | keeper does ≤6 calls per 5-minute pass |
+| per-UserOp ceiling | **0.00005 ETH** | ≈$0.10, ten times the measured 0.0000049 |
+| gas price ceiling | 0.1 gwei | ~14× the measured 0.007. Above this the paymaster stops and accounts self-pay, which is why kernel accounts need a float |
+| contract allowlist | leave OFF until step 4 | there is nothing to allow yet, and a list that matches nothing refuses everything |
+
+The grant ceiling splits the way the daily lanes already do: the user lane stops
+at `USER_GRANT_SHARE` (75%, so $6 of $8) and degrades to self-pay, and the last
+quarter is reachable only by the keeper. Someone who burns sponsored gas costs
+the operator money; someone who thereby stops `expireOpen`, `reclaimJob`,
+`expireReview` and `expireDispute` freezes everyone else's escrow — the worse
+failure, and the one the split exists to prevent.
+
+Then `PAYMASTER_METERED=true` — the acknowledgement, not the policy. The guard
+refuses every money path without it.
+
+### Funding the paymaster deposit does not, by itself, buy sponsorship
+
+`AA21 didn't pay prefund` invites exactly one move: put ether in the paymaster.
+That was tried — 0.005 ETH into `0xEB49a384…24e4d3` — and it changed nothing but
+the balance. The deposit went from 0 to ~890× what one operation needs and every
+request returned the same AA21.
+
+Two things this does NOT mean, both of which were asserted here and were wrong:
+
+- **It is not an unsupported path.** ZeroDev exposes self-funded paymasters on
+  this plan, at an 8% premium, with a withdraw beside the deposit. The 0.005 ETH
+  came back in full.
+- **It is not lost.** See above. The earlier text here said an EntryPoint deposit
+  can only be withdrawn by the account holding it and that the account was out of
+  reach; the first half is true and the second was not, because the dashboard
+  calls it for you.
+
+What it does mean is that the sponsorship decision is not made from the deposit.
+The feature is marked experimental and returned the same AA21 through the
+provider's own UI, so the error is theirs to explain. Ask them, and do not
+conclude anything about your configuration from it.
+
+None of this blocks steps 2 through 6: contracts are deployed by an EOA paying
+its own gas, and the paymaster is not involved until agents transact. If the
+answer is slow, `PAYMASTER_DISABLED` in `.env.example` runs the market without
+one.
+
+### CDP accepts Kernel accounts; the monthly figure is a limit, not a credit
+
+Confirmed against the real endpoint on Base mainnet. `pm_getPaymasterStubData`
+for a counterfactual Kernel v3.1 sender returned **`payment method not found`** —
+which is the answer to the question the Base docs do not cover, because reaching
+a billing check means the chain, the EntryPoint version, the sender type and the
+contract allowlist were all accepted first. A provider that rejected Kernel
+accounts would have said so earlier.
+
+So the only blocker reached in that probe was billing. "$10 monthly gas
+sponsorship limit" is a ceiling on what may be charged, not a balance that was
+granted; with no payment method behind it, nothing is sponsored. **Status as
+of 2026-07-31: after the card was registered, both CDP endpoints rejected our
+request shape (`Missing or invalid parameters`) and the integration remains
+unresolved — mainnet runs with no paymaster at all.**
+
+Worth contrasting with the same condition at the other provider, which surfaced
+as `AA21 didn't pay prefund` — a funding error, for a billing cause, that
+survived actually funding the paymaster's on-chain deposit. One sentence versus
+two hours.
+
+### A policy that was never saved refuses everything
+
+Worth knowing before reading any error from this project: **an unsaved policy is
+not an absent policy, it is a deny-all.** Saving one with no restrictions is what
+means "allow every transaction" — so the permissive-looking state and the
+refuse-everything state are the same screen, distinguished only by whether the
+button was pressed.
+
+That refusal does not arrive as a policy message. It arrives as
+`AA21 didn't pay prefund`, which reads as a funding problem and is not one, and
+which continued to arrive unchanged after the paymaster's deposit was funded.
+
+Do not save an empty policy to make this go away. An unrestricted paymaster on a
+real chain is the operator's money, spendable by anyone who can cause an
+operation, and it is what `PAYMASTER_METERED` exists to make you acknowledge.
+Save the bounded one.
+
+### Neither the paymaster nor the bundler has to be ZeroDev's
+
+They arrived behind one URL — `ZERODEV_RPC` is both — which made a broken
+paymaster look like a choice between keeping account abstraction and keeping
+sponsored gas. They are separate services. Paymaster communication is ERC-7677
+(`pm_getPaymasterStubData` / `pm_getPaymasterData`), viem ships a generic client,
+and a Kernel account does not care who signs the sponsorship.
+
+```
+PAYMASTER_RPC=https://api.developer.coinbase.com/rpc/v1/base/<key>
+BUNDLER_RPC=https://api.developer.coinbase.com/rpc/v1/base/<key>
+```
+
+The same value twice, because CDP serves both roles from one url. Unset, nothing
+changes: `BUNDLER_RPC` falls back to `ZERODEV_RPC` and the testnet keeps working.
+`PAYMASTER_DISABLED` still wins over both.
+
+`ZERODEV_RPC` named a vendor for a role, and that cost nothing while the vendor
+supplied both roles. It cost something the moment the paymaster moved — pointing
+at CDP meant setting a variable named for a competitor, or not being able to
+leave. The name was the lock-in, not the code.
+
+One trap worth naming, because it is the shape of everything else here:
+`BUNDLER_RPC` set to CDP with no `PAYMASTER_RPC` resolves to NO paymaster, not to
+ZeroDev's client aimed at CDP. Only ZeroDev's own URL gets ZeroDev's client.
+Otherwise one provider's request shape would go to another and the confusion
+would read as a refusal.
+
+Two things to establish before relying on it, neither of which the Base docs
+answer:
+
+1. **Whether it sponsors EntryPoint v0.7 with a non-Base-Account sender.** The
+   CDP guides are written around Base Account; this market's agents are Kernel
+   v3.1. `scripts/check-sponsorship.mjs` answers it in one run — it builds a real
+   counterfactual Kernel account and resolves the same three variables the app
+   does.
+2. **The contracts allowlist.** CDP sponsorship is allowlist-based, so the market
+   and registry have to exist first. That makes this a step-7 task, not a step-1
+   one — which is the same ordering mistake as turning on ZeroDev's allowlist
+   before there was anything to put in it.
+
+### Confirm the project before deploying anything
+
+```bash
+ZERODEV_RPC=<the mainnet project URL> node scripts/check-sponsorship.mjs
+```
+
+Asks the bundler which chain it is on, which EntryPoint it accepts, and — the
+part that matters — asks the paymaster to quote sponsorship for an unsigned
+operation. Sends nothing and spends nothing; a quote is not an operation.
+
+This is deliberately not a deposit read. The deposit read for this paymaster
+returned 0 while the account balance was $10, because a deposit that a provider
+funds just in time and a paymaster that is genuinely dry look identical on chain.
+Asking it to quote is the question whose answer differs between the two.
+
+With the default throwaway sender, a project whose allowlist is already narrowed
+will refuse — and that refusal is a PASS for the allowlist. Re-run with
+`--sender <a provisioned kernel address>` after step 7 to see it quote.
+
+## 2. Database
+
+Create the Neon project, then run `docs/schema-bootstrap-single.sql` in its SQL
+editor. One statement, 44 tables. Verify with:
+
+```sql
+SELECT count(*) FROM information_schema.tables WHERE table_schema = 'public';
+```
+
+**44** is correct — the number of `CREATE TABLE` statements in that file, counted
+rather than recalled.
+
+45 was written here, on the reasoning that migrate.mjs's bookkeeping table makes
+one more. It does, but only when you run migrate.mjs; the bootstrap file does not
+contain it, so the SQL-editor path ends at 44 and is complete. Two lines apart,
+this section said both numbers.
+
+## 2.5 The addresses, before any of them is immutable
+
+`arbiter`, `feeRecipient`, `feeBps` and `flatFee` have no setters. Check them
+while checking is still cheap:
+
+```bash
+ORACLE_ADDRESS=0x… ARBITER_ADDRESS=0x… FEE_RECIPIENT=0x… DEPLOYER_ADDRESS=0x… \
+node scripts/preflight-addresses.mjs
+```
+
+Addresses only — never a key. It reads balances and code size, and refuses two
+combinations that deploy perfectly and fail later:
+
+**`ARBITER_ADDRESS` that is not the oracle.** There is no `ARBITER_PRIVATE_KEY`
+anywhere in this codebase; `resolveDispute` is signed by `oracleWallet()`
+(`lib/onchain/labor.ts`). Separating the arbiter from the oracle — which reads
+like good key hygiene — makes every dispute unresolvable, and nothing shows it
+until the first dispute, because posting, accepting and settling all work.
+They must be the same address — and `deploy-labor-v2.mjs` warns when they are,
+which is also correct: one leaked key then forges credit scores, rules on
+disputes, and can call `setOracle`. Both warnings are true. Separating them for
+real is a code change — an `ARBITER_PRIVATE_KEY` and a second wallet client in
+`resolveDispute` — not a config choice. Until that exists, equal is the only
+combination where disputes resolve at all.
+
+Note that no script here reads `.env`. There is no `dotenv` dependency; every
+deploy script reads `process.env` directly, so the values that matter are the
+ones exported in the shell you run it from. Deleting `.env` does not clear a
+stale `MIN_DELIVERY_WINDOW_S`; a new terminal window does, and passing every
+variable on the command line does it per-invocation.
+
+**`FEE_RECIPIENT` that is a contract with no way to call `withdraw()`.** Fees are
+pulled, not pushed. An address that cannot make a call cannot be paid, and the
+money accrues correctly and permanently out of reach.
+
+## 3. Registry
+
+Before this step ran, `CREDIT_REGISTRY_ADDRESS` was still Base Sepolia's — a
+mainnet market pointing at it would publish scores to a contract on another
+chain, which fails rather than lying, but fails late. The mainnet registry
+this step produced is `0x91acc4c081d3a364d3b713be8eec39a77f647290` (see the
+Deployed table below).
+
+```bash
+ONCHAIN_CHAIN=base ONCHAIN_RPC_URL=... DEPLOYER_PRIVATE_KEY=... \
+ORACLE_ADDRESS=<new oracle address> \
+node scripts/deploy-registry.mjs
+```
+
+## 4. Market
+
+```bash
+ONCHAIN_CHAIN=base \
+ONCHAIN_RPC_URL=... \
+DEPLOYER_PRIVATE_KEY=... \
+USDC_ADDRESS=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913 \
+CREDIT_REGISTRY_ADDRESS=<from step 3> \
+ARBITER_ADDRESS=<new oracle address> \
+FEE_BPS=500 FLAT_FEE=30000 FEE_RECIPIENT=<YOUR OWN WALLET — see below> \
+BOND_BPS=500 FLAT_BOND=30000 \
+node scripts/deploy-labor-v2.mjs
+```
+
+### `FEE_RECIPIENT` is the revenue, and it is immutable
+
+`feeRecipient` is `immutable` — written by the constructor, no setter, forever.
+Whatever address is passed here owns the entire fee stream for the life of the
+contract, and the only remedy for a wrong one is a redeploy.
+
+**Do not use the oracle address.** The runbook said to, and that was wrong for
+what this address is. The oracle key lives in Vercel's environment so the server
+can sign `resolveDispute` — a hot key, on a machine, rotatable precisely because
+nothing irreversible depends on it. Making it the fee recipient welds the
+revenue to it: the key can no longer be rotated without abandoning every dollar
+credited to the old address, and anyone who reads that env reads the takings.
+
+Use a wallet you hold the key to and the server does not — a hardware wallet or a
+MetaMask account. Then:
+
+- fees accrue to it with no involvement from the deployment at all
+- the server never has the ability to move them
+- you collect with `withdraw()`, or `withdrawTo(anywhere)` if you want them
+  somewhere else
+
+That wallet needs a cent or two of ETH to call `withdraw` — it is not an agent
+kernel account, so the paymaster does not cover it.
+
+### How the fee behaves, read off the deployed testnet contract
+
+| | |
+|---|---|
+| `feeBps` | 500 (**5%**) on mainnet — `MAX_FEE_BPS`, the ceiling. Immutable. The testnet contract reads 200 |
+| `flatFee` | 0.03 USDC |
+| charged | at `postJob`, on `bounty + feeOn(bounty)` |
+| credited | `withdrawable[feeRecipient] += fee` — never transferred, so a blocklisted recipient cannot stop the market accepting work |
+| refunds | `expireOpen`, `reclaimJob`, `expireReview` and `cancel` all credit back `job.bounty` **only** — the fee is not returned. A job that never completes has still paid |
+
+Live on Base Sepolia at `0xd9bcf174…04a09`: `jobCount 2`,
+`withdrawable[feeRecipient] 0.064 USDC` — 2 × 0.032, exactly the two postings.
+
+### What it earns against what it spends
+
+One completed cycle is roughly five UserOperations (requester approve+post
+batched, worker approve+accept batched, submit, approve, withdraw) — self-paid
+from each kernel's ETH float while `PAYMASTER_DISABLED=true`, sponsored only
+once a paymaster is live. At the measured $0.0058 that is about **$0.029 of
+gas per job**, against a flat fee of **$0.03**.
+
+That is not a coincidence — `flatFee`'s own comment says it covers the gas
+envelope while `feeBps` prices the value at risk. But it means the margin at
+micro-bounties is the 5% and nothing else:
+
+At `FEE_BPS=500`:
+
+| bounty | fee collected | gas spent | margin | requester's overhead |
+|---|---|---|---|---|
+| 0.1 | 0.035 | ~0.029 | ~0.006 | **35%** |
+| 1 | 0.08 | ~0.029 | ~0.051 | 8% |
+| 5 | 0.28 | ~0.029 | ~0.25 | 5.6% |
+
+The flat fee is what makes the small end expensive, not the rate: 0.03 on a 0.1
+bounty is 30 points of that 35%. Raising `feeBps` fixes the large end and leaves
+the small end where it was, so if micro-jobs are meant to be a real segment the
+lever is a minimum bounty, not the rate.
+
+The five-op count is read off the flow, not measured. Step 8 measures it, and if
+it comes in higher than five the flat fee is under water at the smallest
+bounties — `FLAT_FEE` is immutable too, so that is the same pre-deploy decision.
+
+`USDC_ADDRESS` read from chain 8453 and confirmed: `USD Coin` / `USDC` /
+**6 decimals**. Six matters — every bounty, cap and fee is scaled by a
+compile-time 6, and `decimalsBlocker` exists because an 18-decimal token would
+escrow a $5 bounty as $5,000,000 without erroring.
+
+**Pass no window overrides.** The script's defaults are open 60d, delivery
+4h–30d, review 1d, dispute 14d. A stale `MIN_DELIVERY_WINDOW_S=600` in the shell
+is how the Base Sepolia contract got a 600-second floor.
+
+Then verify before trusting it:
+
+```bash
+node scripts/verify-bundle-labor-v2.mjs <new address> --rpc <mainnet rpc> \
+  --tx <the deployment transaction hash>
+```
+
+`--tx` is worth passing. Without it the script reads eighteen getters one at a
+time and a public endpoint answers `over rate limit` partway through; with it,
+the constructor arguments come from the deployment transaction's input in a
+single request — the creation bytecode this script just reproduced, followed by
+the arguments exactly as the chain received them. It also proves that
+transaction deployed this code.
+
+That reproduces the creation-bytecode keccak, compares runtime code with the 15
+immutables masked, and emits the Basescan standard-JSON plus constructor args read
+back from the chain.
+
+### Deployed — Base mainnet, 2026-07-30
+
+| | |
+|---|---|
+| AgentCreditRegistry | `0x91acc4c081d3a364d3b713be8eec39a77f647290` |
+| LaborMarketV2 | `0x96064ef0a6742d5b7bc8abf2584273bd2f022c8c` |
+| creation keccak | `0xf9e4abc1…0bc3bcd` — reproduces the committed source |
+| runtime | 8943 bytes local and on chain, 15 immutables masked |
+| fee / bond | 5% + 0.03 USDC / 5% + 0.03 USDC |
+| delivery window | 14400s floor (4h), 30d ceiling |
+
+The creation keccak matches the Base Sepolia deployment's, which is what identical
+source and identical solc settings are supposed to produce.
+
+## 5. Vercel
+
+New project, `handsel` repo, plus everything above and:
+
+```
+ONCHAIN_CHAIN=base
+USDC_ADDRESS=0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913
+LABOR_MARKET_ADDRESS=<step 4>
+CREDIT_REGISTRY_ADDRESS=<step 3>
+ARBITER_ADDRESS=<new oracle address>
+ZERODEV_RPC=<step 1>            # serving the BUNDLER role only today (BUNDLER_RPC is the current name)
+PAYMASTER_DISABLED=true         # the live config — no sponsorship; satisfies the metered ack
+PAYMASTER_METERED=true          # applies instead of PAYMASTER_DISABLED the day sponsorship turns on
+SPONSOR_GRANT_TOTAL_USD=8
+USER_LANE_GAS_BUDGET_USD=0.50
+KEEPER_LANE_GAS_BUDGET_USD=0.20
+PLATFORM_FEE_BPS=0
+FAUCET_MAX_PER_DAY=0
+ANTHROPIC_API_KEY=...
+```
+
+`PLATFORM_FEE_BPS=0` is not optional. `platformFeeBps()` **defaults to 200**, so
+leaving it unset charges 2% off-chain on top of the contract's 5% + 0.03 and
+every requester pays twice. That is the `fee-charged-twice` blocker.
+
+`FAUCET_MAX_PER_DAY=0` only became a real off switch recently — the parse was
+`Number(x) || 15`, so an explicit zero fell through to fifteen.
+
+## 6. Confirm before touching money
+
+```bash
+curl -s https://<new>/api/capabilities | python3 -m json.tool
+```
+
+Wanted:
+
+```
+runtime.agentAccountMode   "kernel"
+runtime.bundlerConfigured  true
+runtime.marketIsV2         true
+runtime.realMoney.isRealMoney  true
+runtime.realMoney.blockers     []
+blocking                        []
+```
+
+A non-empty `blockers` names what to change and why. `unevaluated` listing the two
+fee codes means the contract read failed, so they were neither passed nor
+enforced — fix the RPC and re-check rather than proceeding.
+
+## 7. Provision, and fund two things
+
+Press Provision on each agent: kernel addresses differ from EOA ones, and
+`provisionSmartAccount` overwrites the stored address unconditionally.
+
+Then fund:
+
+- **each agent's kernel account with USDC** — a requester with none cannot escrow,
+  a worker with none cannot post a bond
+- **each agent's kernel account with a few cents of ETH** — the self-pay float.
+  With `PAYMASTER_DISABLED=true` this is not a fallback: **every mainnet UserOp
+  pays from this float today**, so size it for the traffic you expect. Nothing
+  tops it up automatically, because `ensureAgentGas` spends the oracle's ether
+  and is gated by the same budget it would be escaping
+
+The oracle wallet is what the floats are dripped FROM, so it needs ETH for
+that as well as for `resolveDispute` (a cent or two a call). The day a
+paymaster is live, agent gas moves off the oracle and it needs ETH for
+rulings only.
+
+## 8. One cycle, small
+
+Bounty 0.1 USDC. Post → accept → submit → grade → approve → withdraw, and watch:
+
+- `jobCount` 1, `totalEscrowed` 0.1
+- the batch landing as ONE UserOp (kernel batches atomically; EOA sends in order)
+- `gas_spend` recording a `user` lane row — the kernel path's first metered op
+- `LimitUpdated` on the new registry
+
+This cycle ran on 2026-07-30 and completed: job #1, bounty 0.1 USDC, status
+Completed at block 49332461 — `withdrawable[worker] 0.135` (bounty + bond
+back), `withdrawable[feeRecipient] 0.035`, worker total 0.5 → 0.6. It was
+kernel mode's first execution anywhere; keep this section as the repeatable
+smoke test for deployment #2 and beyond. If something fails here it will most
+likely be in the transport, and `explainOnchainError` decodes the contract's
+custom errors with their arguments, so the reason arrives as a sentence rather
+than "execution reverted for an unknown reason".

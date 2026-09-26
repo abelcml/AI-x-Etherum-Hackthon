@@ -1,0 +1,525 @@
+/**
+ * Auto-mine: the poll loop IS the mining loop.
+ *
+ * When a local worker polls for work and its queue is empty, this claims
+ * the next qualifying Open job on its behalf — accept on-chain, dispatch
+ * the run — so a GPU owner's pipeline is: flip Auto-mine on, leave the
+ * worker running, done. No daemon exists anywhere: the worker's own 3s
+ * heartbeat drives acceptance, which degrades gracefully to "nothing
+ * happens" when the worker is offline (exactly right — a job should never
+ * be claimed by a machine that isn't there to do it).
+ *
+ * Rules per tick: the agent takes as many blocks as it has FREE concurrency
+ * slots (ceiling = resolveMiningConcurrency(), default 3, env-overridable) —
+ * where a slot is one in-flight task. maxSlots === 1 reproduces the old
+ * single-slot "only when fully idle, one job per tick" behaviour. Only jobs
+ * whose minScore the agent clears (avoids a guaranteed on-chain revert),
+ * that it didn't post itself, and whose test lineage it hasn't already
+ * failed. A crash window between accept and dispatch is self-healed on the
+ * next tick by re-dispatching accepted-but-taskless jobs.
+ *
+ * Accepts WITHIN one agent stay serial: each acceptJob is a UserOp from the
+ * agent's single smart account and they share a nonce, so firing them in
+ * parallel would collide. Cross-agent parallelism lives one level up
+ * (tickCloudAutoMineAgents) where each agent is a distinct account. See
+ * docs/parallel-mining.md.
+ */
+import { db } from '@/lib/db'
+import { agent, agentTask, jobSpec, type agent as agentTable } from '@/lib/db/schema'
+import { and, eq, inArray } from 'drizzle-orm'
+import { acceptAndDispatchJob, dispatchAcceptedJob, JOB_CLAIM_TTL_MS } from '@/lib/labor-dispatch'
+import { logPlatformEvent } from '@/lib/platform-feed'
+import { lanesFor } from '@/lib/job-lane-server'
+import { mapLimit } from '@/lib/concurrency'
+import type { OnchainJob } from '@/lib/onchain/labor'
+import {
+  selectMiningBlocks,
+  freeMiningSlots,
+  resolveMiningConcurrency,
+  resolveSweepConcurrency,
+  type MiningCandidate,
+} from '@/lib/mining-scheduler'
+
+type AgentRow = typeof agentTable.$inferSelect
+
+export async function autoMineTick(
+  agent: AgentRow,
+  callbackUrl: string,
+  // opts.jobs lets a cross-agent sweep pass ONE shared on-chain snapshot so N
+  // agents don't each call readJobs() (RPC amplification). Selection tolerates
+  // a slightly stale snapshot — the atomic claim + on-chain accept re-check
+  // catch anything taken since (the loser just tries the next block).
+  opts?: { maxSlots?: number; jobs?: OnchainJob[] },
+): Promise<boolean> {
+  if (!agent.autoMine || !agent.smartAccountAddress) return false
+
+  const active = await db
+    .select({ id: agentTask.id })
+    .from(agentTask)
+    .where(and(eq(agentTask.agentId, agent.id), inArray(agentTask.status, ['queued', 'running', 'processing'])))
+  const maxSlots = opts?.maxSlots ?? resolveMiningConcurrency()
+  let free = freeMiningSlots(active.length, maxSlots)
+  if (free <= 0) {
+    // Say WHY the sweep skipped, or a full-slot agent with a doomed accepted
+    // job is indistinguishable from a healthy busy one in the logs — the
+    // exact ambiguity that made the self-heal look broken while it was
+    // actually never reached.
+    console.info(`[auto-mine] ${agent.name}: ${active.length}/${maxSlots} slots in flight — skipping sweep (heal included)`)
+    return false
+  }
+
+  const { isLaborMarketConfigured } = await import('@/lib/onchain/config')
+  if (!isLaborMarketConfigured()) return false
+
+  // An agent that cannot pay for gas cannot claim anything, so let it find out
+  // once here instead of once per candidate job.
+  //
+  // Measured on a real sweep: six unfunded agents on one account each tried
+  // every open job, each attempt building a UserOperation and simulating it
+  // before hitting `holds 0 wei` — which drove base-mainnet.infura.io to 429
+  // and knocked out the reads the four agents that COULD work depended on.
+  // The unfunded ones cost nothing to satisfy and everything to ignore.
+  //
+  // One eth_getBalance, and only when nothing is sponsoring the gas. Failing
+  // the probe does NOT skip the agent: an RPC hiccup must not silently stop a
+  // funded worker from mining, and the real check still runs at send time.
+  const { agentGasReadiness } = await import('@/lib/agent-provision')
+  let readiness = await agentGasReadiness(agent.smartAccountAddress)
+  if (!readiness.ready && readiness.weiHeld !== 'unknown') {
+    // "Nothing is sponsoring gas" stopped being true when the account gained
+    // a pool of its own. Ask before writing the agent off: the pool is the
+    // owner's own ether, designated on purpose, and an agent it can rescue is
+    // not an agent that should sit out the sweep.
+    //
+    // Here rather than only at send time because the whole point of the
+    // preflight is to answer the question once instead of once per candidate
+    // job — an agent sponsored on its first accept would otherwise be skipped
+    // for the entire tick that could have funded it.
+    const { sponsorAgentGas } = await import('@/lib/local-paymaster')
+    const outcome = await sponsorAgentGas(agent.id)
+    if (outcome.sponsored) {
+      readiness = await agentGasReadiness(agent.smartAccountAddress)
+    } else if (outcome.why !== 'no-pool' && outcome.why !== 'already-funded') {
+      // A pool exists and did not pay. That is worth one line — silence here
+      // reads as "no pool configured", which is the one thing it is not.
+      console.info(`[auto-mine] ${agent.name} is out of gas and the account pool did not cover it (${outcome.why})`)
+    }
+  }
+  if (!readiness.ready && readiness.weiHeld !== 'unknown') {
+    console.info(
+      `[auto-mine] ${agent.name} holds ${readiness.weiHeld} wei and nothing is sponsoring gas — skipping its sweep`,
+    )
+    return false
+  }
+
+  let jobs: OnchainJob[]
+  if (opts?.jobs) {
+    jobs = opts.jobs // shared snapshot from the sweep — one read for all agents
+  } else {
+    const { readJobs } = await import('@/lib/onchain/labor')
+    jobs = await readJobs().catch(() => [])
+  }
+  const myAddress = agent.smartAccountAddress.toLowerCase()
+  let didWork = false
+
+  // Self-heal first: jobs this agent already accepted on-chain whose dispatch
+  // never happened (a crash between accept and runAgentTask) — or whose
+  // dispatch ran and FAILED off-chain (e.g. every assisted write 400ing while
+  // the model key was out of credits): both leave escrow Accepted-but-doomed
+  // until the deadline refunds it. shouldHealAcceptedJob (pure, tested) says
+  // which is which; dispatch is off-chain, so healing several is nonce-safe;
+  // each consumes a slot.
+  for (const j of jobs) {
+    if (free <= 0) break
+    if (j.status !== 'Accepted' || j.worker.toLowerCase() !== myAddress) continue
+    const [spec] = await db.select().from(jobSpec).where(eq(jobSpec.specHash, j.specHash))
+    if (!spec) continue
+    let taskStatus: string | null = null
+    let taskAgeMs: number | null = null
+    let taskReportedSuccess: boolean | null = null
+    let taskOutput: string | null = null
+    if (spec.agentTaskId) {
+      const [t] = await db
+        .select({ status: agentTask.status, updatedAt: agentTask.updatedAt, result: agentTask.result, output: agentTask.output })
+        .from(agentTask)
+        .where(eq(agentTask.id, spec.agentTaskId))
+      taskStatus = t?.status ?? null
+      taskAgeMs = t?.updatedAt ? Date.now() - t.updatedAt.getTime() : null
+      const success = (t?.result as { success?: unknown } | null)?.success
+      taskReportedSuccess = typeof success === 'boolean' ? success : null
+      taskOutput = t?.output ?? null
+    }
+    const { shouldHealAcceptedJob, shouldResubmitAcceptedJob } = await import('@/lib/mining-scheduler')
+    // The on-chain deadline is unix seconds; a market without deadlines (V1)
+    // reports none, and unknown never blocks the heal.
+    const deadlineRunwayMs = j.deadline ? j.deadline * 1000 - Date.now() : null
+    // Finished work whose on-chain submitWork was eaten (lib/mining-scheduler
+    // shouldResubmitAcceptedJob): retry the SUBMISSION, never the dispatch —
+    // the deliverable exists and was graded on its way in. Same hash the
+    // callback would have recorded (lib/callback/labor-market.ts), so a late
+    // landing and this retry describe the same bytes.
+    if (shouldResubmitAcceptedJob({ hasTask: Boolean(spec.agentTaskId), taskStatus, taskReportedSuccess })) {
+      try {
+        const { keccak256, toHex } = await import('viem')
+        const { submitWork } = await import('@/lib/onchain/labor')
+        await submitWork(agent.id, j.id, keccak256(toHex(taskOutput || '(empty output)')))
+        console.info(`[auto-mine] job ${j.id} (${agent.name}): re-submitted finished work on-chain — the original submitWork never landed`)
+        await logPlatformEvent('JOB_SUBMITTED', `"${spec.title}" — finished work re-submitted after a failed on-chain submission`)
+        didWork = true
+      } catch (error) {
+        const { isUserOpPending } = await import('@/lib/onchain/account')
+        if (isUserOpPending(error)) {
+          console.warn(`[auto-mine] job ${j.id}: re-submission pending confirmation`)
+        } else {
+          console.error(`[auto-mine] job ${j.id}: re-submission failed (will retry next sweep):`, error)
+        }
+      }
+      continue
+    }
+    if (shouldHealAcceptedJob({ hasTask: Boolean(spec.agentTaskId), taskStatus, taskAgeMs, taskReportedSuccess, deadlineRunwayMs })) {
+      if (spec.agentTaskId) {
+        console.info(`[auto-mine] re-dispatching job ${j.id} for ${agent.name} — previous dispatch failed`)
+      }
+      await dispatchAcceptedJob(agent, j.id, spec, callbackUrl)
+      free -= 1
+      didWork = true
+    } else {
+      // An Accepted job the heal looked at and left alone must say why, or a
+      // doomed one is indistinguishable from one whose worker is mid-run —
+      // the exact silence that hid this path's wiring gaps twice already.
+      console.info(
+        `[auto-mine] job ${j.id} (${agent.name}): heal declined — task=${taskStatus ?? 'none'} reportedSuccess=${taskReportedSuccess ?? 'unknown'} age=${taskAgeMs === null ? '?' : Math.round(taskAgeMs / 60_000)}m runway=${deadlineRunwayMs === null ? '?' : Math.round(deadlineRunwayMs / 60_000)}m`,
+      )
+    }
+  }
+  if (free <= 0) return didWork
+
+  // Resolve every Open job's spec in ONE query (was N+1 inside the loop).
+  const openJobs = jobs.filter((j) => j.status === 'Open')
+  const specHashes = openJobs.map((j) => j.specHash)
+  const specs = specHashes.length
+    ? await db.select().from(jobSpec).where(inArray(jobSpec.specHash, specHashes))
+    : []
+  const specByHash = new Map(specs.map((s) => [s.specHash, s]))
+  const candidates: MiningCandidate[] = []
+  for (const j of openJobs) {
+    const spec = specByHash.get(j.specHash)
+    if (spec) candidates.push({ job: j, spec }) // structurally satisfies MiningCandidate
+  }
+
+  const score = Math.round(parseFloat(agent.creditScore))
+  const { faucetAgentId, faucetReservedFor } = await import('@/lib/job-faucet')
+  const faucetId = await faucetAgentId().catch(() => null)
+  const now = Date.now()
+  const { workerCanDeliver } = await import('@/lib/artifacts')
+  const { reservationsByHash, assignmentsByHash } = await import('@/lib/job-reservation')
+  const [reservedBy, assignedBy] = await Promise.all([
+    reservationsByHash(specHashes).catch(() => new Map<string, string>()),
+    assignmentsByHash(specHashes).catch(() => new Map<string, string>()),
+  ])
+  const specHashByJobId = new Map(openJobs.map((j) => [j.id, j.specHash]))
+
+  // This agent has cleared the gas preflight, so for its OWN assigned open
+  // jobs it is able to claim right now — and the priority window measures
+  // time spent able and idle, not time since posting. Starting the clock here
+  // is what stops a desk from losing its own work while it was blocked (see
+  // RESERVATION_TTL_MS). A ready agent normally claims in this same tick, so
+  // the stamp only bites when it was ready and passed.
+  const mineAndOpen = openJobs.map((j) => j.specHash).filter((h) => assignedBy.get(h) === agent.id)
+  if (mineAndOpen.length) {
+    const { markReservationsEligible } = await import('@/lib/job-reservation')
+    await markReservationsEligible(mineAndOpen, agent.id).catch((e) =>
+      console.warn('[auto-mine] could not start the reservation clock:', e),
+    )
+  }
+  /** Work this office posted and assigned to this exact agent. The owner
+   *  covers the bond on it (lib/office-bond-cover.ts), so an empty balance is
+   *  not a reason to skip — it is a reason to top up on the way in. */
+  const isMineByAssignment = (jobId: number) => {
+    const hash = specHashByJobId.get(jobId)
+    return Boolean(hash && assignedBy.get(hash) === agent.id)
+  }
+
+  // Accepting stakes a bond in USDC out of the worker's own account, so an
+  // agent's balance decides which bounties it can even attempt. One balance
+  // read and one schedule read (immutable, cached) answer that for every
+  // candidate; without them the miner builds a UserOperation per job and
+  // learns the same thing from a `TransferFailed()` revert in simulation.
+  //
+  // Unreadable => allow, exactly as the gas preflight does. A probe that
+  // cannot answer must not be the thing that stops a solvent worker; the
+  // contract still refuses what it should.
+  const { bondReadiness } = await import('@/lib/agent-bond')
+  const { bondScheduleOf } = await import('@/lib/onchain/labor-v2')
+  const { usdcBalanceOf } = await import('@/lib/onchain/treasury')
+  const [bondSchedule, heldUsd] = await Promise.all([
+    bondScheduleOf().catch(() => null),
+    usdcBalanceOf(agent.smartAccountAddress as `0x${string}`).catch(() => null),
+  ])
+  let bondShortfall: { bounty: number; shortUsd: number } | null = null
+
+  // Lanes come from a side table (lib/job-lane-server.ts), read for exactly
+  // the specs in play. A failed read degrades to "no lanes declared" rather
+  // than stalling mining — an unknown lane is `any`, which is what these
+  // jobs meant before lanes existed.
+  const lanes = await lanesFor(candidates.map((c) => c.spec.specHash)).catch(() => new Map<string, string>())
+  for (const c of candidates) {
+    ;(c.spec as { lane?: string | null }).lane = lanes.get(c.spec.specHash) ?? null
+  }
+
+  // How far this worker may bid (lib/mine-scope.ts). An office's hired
+  // specialist defaults to its own account's work; a worker somebody switched
+  // on themselves keeps the whole board. Resolved per tick rather than cached
+  // so a scope change takes effect on the next sweep, not the next deploy.
+  const { effectiveMineScope } = await import('@/lib/mine-scope-server')
+  const { scope } = await effectiveMineScope(agent.id).catch(() => ({ scope: 'market' as const }))
+  // Who the account's agents are — needed by the `own` scope AND by the
+  // self-deal pre-filter below, so built for every tick.
+  // `agent` is the ROW here (the parameter shadows the schema table), so
+  // the table has to come in under another name.
+  const { agent: agentTbl } = await import('@/lib/db/schema')
+  const siblings = await db
+    .select({ addr: agentTbl.smartAccountAddress })
+    .from(agentTbl)
+    .where(eq(agentTbl.userId, agent.userId))
+  const ownAddresses = new Set(siblings.map((a) => a.addr?.toLowerCase()).filter((a): a is string => Boolean(a)))
+
+  // A same-account job is claimable by exactly one agent: the one its
+  // assignment names — assertNotSelfDeal refuses every other sibling, with
+  // no TTL and no luck involved. Attempting anyway is what the Architect
+  // worker did to its desk's reader steps every 3-second poll once their
+  // priority window lapsed: a guaranteed refusal, logged with a stack trace,
+  // after a full claim attempt — pure noise and pure spend. Deterministic
+  // refusals get filtered before anything is attempted; strangers' lapsed
+  // reservations stay fair game exactly as before.
+  const beforeDoomFilter = candidates.length
+  const claimableCandidates = candidates.filter(
+    (c) => !(ownAddresses.has(c.job.requester.toLowerCase()) && assignedBy.get(c.spec.specHash) !== agent.id),
+  )
+  if (claimableCandidates.length < beforeDoomFilter) {
+    candidates.length = 0
+    candidates.push(...claimableCandidates)
+  }
+
+  // The same doom class for the visibility split: an office-scoped job is
+  // claimable only inside its circle — acceptAndDispatchJob refuses everyone
+  // else, deterministically, after a full claim attempt with a stack trace
+  // in the log. The day the split shipped, a stranger's miner hammered one
+  // scoped job with exactly that refusal every sweep. Visibility is resolved
+  // once per foreign office owner, not per candidate, and an unreadable
+  // check drops the job: a refusal costs this agent its claim slot, so
+  // "unknown" here is not the harmless kind.
+  const scopedOwnerIds = [...new Set(candidates.map((c) => c.spec.officeOwnerId).filter((o): o is string => Boolean(o)))]
+  if (scopedOwnerIds.length) {
+    const { canSeeOfficeOnlyJob } = await import('@/lib/office')
+    const visibleByOwner = new Map<string, boolean>()
+    for (const ownerId of scopedOwnerIds) {
+      visibleByOwner.set(ownerId, await canSeeOfficeOnlyJob(ownerId, agent.userId).catch(() => false))
+    }
+    const inCircle = candidates.filter((c) => !c.spec.officeOwnerId || visibleByOwner.get(c.spec.officeOwnerId))
+    if (inCircle.length < candidates.length) {
+      candidates.length = 0
+      candidates.push(...inCircle)
+    }
+  }
+
+  // Fitness: can this agent actually DO these jobs (lib/claim-fitness.ts)?
+  //
+  // Built ONCE per tick and reused for every candidate — the per-agent facts
+  // (turnaround median, recent failures by class) are one query over this
+  // agent's own history, and asking per job would make it N.
+  //
+  // Repo permission is deliberately left `unknown` here, which never blocks.
+  // Answering it needs a GitHub round trip per job, and the real gate is
+  // assertFitToClaim inside acceptAndDispatchJob — same relationship as the
+  // reservation courtesy filter: cheap and approximate here, authoritative
+  // there, and nothing is spent in between.
+  const fitCtx = await (async () => {
+    const { agentFitnessContext } = await import('@/lib/claim-fitness-server')
+    return await agentFitnessContext(agent).catch(() => null)
+  })()
+  let fitCandidates = candidates
+  if (fitCtx) {
+    const { assessClaimWith } = await import('@/lib/claim-fitness-server')
+    const said = new Set<string>()
+    fitCandidates = candidates.filter((c) => {
+      const verdict = assessClaimWith({
+        ctx: fitCtx,
+        spec: c.spec,
+        deadlineSec: c.job.deadline ?? null,
+        repoAccess: 'unknown',
+        autonomous: true,
+      })
+      if (verdict.ok) return true
+      // One line per distinct reason, not per job: a worker sitting out a
+      // whole class would otherwise print the same sentence twenty times,
+      // and an operator stops reading a log that repeats itself.
+      const blocked = verdict.blocked!
+      if (!said.has(blocked.code)) {
+        said.add(blocked.code)
+        console.info(`[auto-mine] ${agent.name} is passing on work: ${blocked.reason}`)
+      }
+      return false
+    })
+  }
+
+  const selected = selectMiningBlocks({
+    candidates: fitCandidates,
+    myAddress,
+    score,
+    agentId: agent.id,
+    // Which lanes this worker may take from. Without it every runtime reads
+    // as the platform default and local-lane jobs get claimed by agents the
+    // platform pays for (lib/job-lane.ts).
+    runtimeType: agent.runtimeType,
+    now,
+    freeSlots: free,
+    claimTtlMs: JOB_CLAIM_TTL_MS,
+    canDeliver: (spec) =>
+      workerCanDeliver(agent.capabilities, spec.deliverableKind ?? 'text', spec.requiredCapabilities),
+    // New-miner priority: freshly-posted faucet jobs stay reserved for
+    // low-credit newcomers during the grace window; a high-credit rig skips
+    // them and takes non-faucet (or post-grace) work instead.
+    isFaucetReserved: (spec) =>
+      Boolean(faucetId && spec.requesterAgentId === faucetId && faucetReservedFor(score, spec.createdAt, now)),
+    scope,
+    // Requester address, not requesterAgentId: the on-chain requester is the
+    // authority on who posted a job, and a third party's spec row carries
+    // their agent id, not ours. Lowercased on both sides — addresses are
+    // case-insensitive and the chain returns them checksummed.
+    isOwnAccountJob: ({ job }) => (ownAddresses ? ownAddresses.has(job.requester.toLowerCase()) : true),
+    isReservedForOther: (spec) => {
+      const reservedFor = reservedBy.get(spec.specHash)
+      return Boolean(reservedFor && reservedFor !== agent.id)
+    },
+    canPostBond: (job) => {
+      if (heldUsd === null) return true // unreadable — let the contract decide
+      if (isMineByAssignment(job.id)) return true // the office pays this one's bond
+      const verdict = bondReadiness(heldUsd, job.bounty, bondSchedule)
+      if (verdict.ready === true || verdict.ready === 'unknown') return true
+      // Remember the cheapest miss, so the tick can say what is actually
+      // wrong instead of going quiet. A worker skipping every job for want of
+      // eleven cents is the single least guessable state this system has.
+      if (!bondShortfall || verdict.shortUsd < bondShortfall.shortUsd) {
+        bondShortfall = { bounty: job.bounty, shortUsd: verdict.shortUsd }
+      }
+      return false
+    },
+  })
+
+  if (selected.length === 0 && bondShortfall) {
+    const { bounty, shortUsd } = bondShortfall as { bounty: number; shortUsd: number }
+    console.info(
+      `[auto-mine] ${agent.name} holds $${(heldUsd ?? 0).toFixed(4)} USDC — $${shortUsd.toFixed(4)} short of the bond on a $${bounty.toFixed(2)} job. Fund it from another of your agents to let it work.`,
+    )
+  }
+
+  // Bankroll discipline (lib/bankroll.ts): a bond is burned when the work
+  // never arrives, so the ruin case for an unattended worker is N bonds
+  // locked when its runtime dies. canPostBond answered "can I afford this
+  // one"; this answers "how much may be at stake at once", Kelly-sized from
+  // this worker's own delivery record. Office-assigned jobs pass through —
+  // the office covers those bonds (lib/office-bond-cover.ts), so they are
+  // not this wallet's exposure.
+  let withinBankroll = selected
+  if (heldUsd !== null && bondSchedule && fitCtx) {
+    const { mayStakeBond } = await import('@/lib/bankroll')
+    const { bondForBounty } = await import('@/lib/agent-bond')
+    const openBondsUsd = jobs
+      .filter((j) => j.status === 'Accepted' && j.worker.toLowerCase() === myAddress)
+      .reduce((sum, j) => sum + bondForBounty(j.bounty, bondSchedule), 0)
+    let plannedUsd = 0
+    withinBankroll = selected.filter((c) => {
+      if (isMineByAssignment(c.job.id)) return true
+      const bondUsd = bondForBounty(c.job.bounty, bondSchedule)
+      const verdict = mayStakeBond({
+        heldUsd,
+        openBondsUsd: openBondsUsd + plannedUsd,
+        bondUsd,
+        bountyUsd: c.job.bounty,
+        delivered: fitCtx.delivered,
+        lost: fitCtx.lostClaims,
+      })
+      if (verdict.ok) {
+        plannedUsd += bondUsd
+        return true
+      }
+      console.info(
+        `[auto-mine] ${agent.name} bankroll: passing on job ${c.job.id} — $${verdict.exposureUsd.toFixed(2)} at stake would exceed the $${verdict.capUsd.toFixed(2)} cap (delivery edge ${Math.round(verdict.edge * 100)}%)`,
+      )
+      return false
+    })
+  }
+
+  // Serial within the agent (shared account nonce). The off-chain claim
+  // inside acceptAndDispatchJob still guards each block against other rigs.
+  for (const { job, spec } of withinBankroll) {
+    try {
+      await acceptAndDispatchJob(agent, job.id, callbackUrl, { autonomous: true })
+      await logPlatformEvent(
+        'JOB_AUTO_ACCEPTED',
+        `${agent.name} auto-claimed job #${job.id} "${spec.title}" (auto-mine)`,
+      )
+      didWork = true
+    } catch (error) {
+      // Lost the race (someone else accepted) or a transient revert — try the
+      // next block rather than giving up the tick.
+      console.error(`[auto-mine] claim of job ${job.id} failed:`, error)
+    }
+  }
+
+  return didWork
+}
+
+// Cheap in-memory cooldown, per serverless instance — good enough for a
+// best-effort sweep (over-ticking across cold instances is harmless;
+// autoMineTick() is self-limiting via its own busy/status checks).
+let lastCloudSweepAt = 0
+const CLOUD_SWEEP_COOLDOWN_MS = 15_000
+
+/**
+ * A local worker's own 3s poll heartbeat IS its mining loop (see the
+ * module doc comment) — but a 'cloud' agent never polls at all; the
+ * platform dispatches TO it, not the other way around (see
+ * dispatchToCloudApi in lib/agent-tasks.ts). Nothing would ever call
+ * autoMineTick() for one on its own. This is the substitute: swept
+ * opportunistically from the same already-frequent read paths that already
+ * call reapStuckTasks() (the Jobs page, the guest page), throttled so an
+ * on-chain read doesn't run on every single request. Best-effort, same
+ * spirit as everything else here — a quiet period with zero site traffic
+ * means no sweep, the same way an offline local worker means no claims.
+ */
+export async function tickCloudAutoMineAgents(callbackUrl: string): Promise<void> {
+  const now = Date.now()
+  if (now - lastCloudSweepAt < CLOUD_SWEEP_COOLDOWN_MS) return
+  lastCloudSweepAt = now
+
+  const { isLaborMarketConfigured } = await import('@/lib/onchain/config')
+  if (!isLaborMarketConfigured()) return
+
+  // Both 'cloud' and 'mcp' agents are push-based — the platform dispatches TO
+  // them (they never poll), so they need this sweep to ever auto-mine.
+  const candidates = await db
+    .select()
+    .from(agent)
+    .where(and(inArray(agent.runtimeType, ['cloud', 'mcp']), eq(agent.autoMine, true)))
+  if (candidates.length === 0) return
+  console.info(`[auto-mine] sweep: ${candidates.length} push-based auto-mine agents`)
+
+  // ONE on-chain read shared across the whole sweep (phase 3b) — otherwise N
+  // agents each call readJobs(), multiplying RPC load exactly when many agents
+  // mine at once. Each tick still re-reads freshly inside acceptAndDispatchJob
+  // before spending gas, so a stale snapshot can't cause a bad accept.
+  const { readJobs } = await import('@/lib/onchain/labor')
+  const jobs = await readJobs().catch(() => [])
+
+  // Fan out across agents — each is a distinct smart account, so their
+  // on-chain accepts don't share a nonce and are safe to run concurrently.
+  // Bounded so a big roster can't stampede a free-tier bundler/RPC.
+  await mapLimit(candidates, resolveSweepConcurrency(), (a) =>
+    autoMineTick(a, callbackUrl, { jobs }).catch((error) => {
+      console.error(`[auto-mine] cloud sweep tick failed for ${a.id}:`, error)
+      return false
+    }),
+  )
+}

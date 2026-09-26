@@ -1,0 +1,89 @@
+# The house Foreman worker — supply as a cron job.
+#
+# Every open repo job on the board gets at least one credible attempt, so a
+# requester's first experience is never "posted and nothing happened". This is
+# real labor under a real budget (the bounty caps the model spend per job by
+# construction — see `foreman work`), not seeded data.
+#
+# Spend control lives in two places: the bounty cap inside foreman, and this
+# schedule (one attempted job per run, a few runs per day). Tighten either to
+# tighten the bill.
+#
+# Required repository secrets (Settings → Secrets → Actions):
+#   ANTHROPIC_API_KEY          — pays for the model; the real cost center
+#   HANDSEL_AGENT_ID        — the house WORKER agent (must be a different
+#                                platform account than the house requester —
+#                                the self-deal block rejects same-account work)
+#   HANDSEL_WORKER_SECRET   — that agent's connection secret
+#
+# Without the secrets the job exits quietly instead of failing the whole
+# Actions tab red.
+name: House worker — attempt one repo job
+
+on:
+  schedule:
+    # Hourly during the launch window: a visitor who labels a bounty should
+    # see a PR within the hour, not within a quarter-day — the loop's latency
+    # IS the demo. Minute offset avoids the :00 stampede. Each run only costs
+    # model budget when a job actually exists (browse-and-exit otherwise).
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Specific job id to claim (default: best-paying open repo job)'
+        required: false
+
+jobs:
+  work:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      # A second, independent heartbeat. GitHub treats `schedule:` as
+      # best-effort and in practice delivers the settlement workflow's
+      # */5 request every 80-100 minutes, which is the latency of every
+      # background sweep (settlement retries, abandoned-claim refunds,
+      # board restocking, loan notices). This run is already scheduled, so
+      # piggybacking a settle call roughly halves that worst case for free.
+      # Failures are ignored on purpose: this is a bonus tick, and the job's
+      # real work is below.
+      - name: Nudge the settlement heartbeat
+        continue-on-error: true
+        run: |
+          if [ -n "${{ secrets.CRON_SECRET }}" ]; then
+            curl -sS --max-time 240 -o /dev/null \
+              -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+              "${{ vars.PLATFORM_URL }}/api/cron/settle" || true
+          fi
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Foreman is built from source rather than pulled from npm: the registry
+      # is published by a human and can lag the code (it did — the first run
+      # of this workflow died on a flag the published 0.1.0 didn't know).
+      # Building from main removes that failure class entirely: the cron
+      # always runs exactly what the repo says.
+      - name: Build foreman from source
+        run: |
+          git clone --depth 1 https://github.com/Kairose-master/Foreman.git foreman
+          cd foreman
+          npm ci
+          npm run build
+
+      - name: Attempt one repo job
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          HANDSEL_AGENT_ID: ${{ secrets.HANDSEL_AGENT_ID }}
+          HANDSEL_WORKER_SECRET: ${{ secrets.HANDSEL_WORKER_SECRET }}
+          JOB_ARG: ${{ inputs.job }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ] || [ -z "$HANDSEL_AGENT_ID" ] || [ -z "$HANDSEL_WORKER_SECRET" ]; then
+            echo "House worker secrets not configured — skipping (this is fine)."
+            exit 0
+          fi
+          if [ -n "$JOB_ARG" ]; then
+            node foreman/dist/cli.js work --clean --json --job "$JOB_ARG"
+          else
+            node foreman/dist/cli.js work --clean --json
+          fi

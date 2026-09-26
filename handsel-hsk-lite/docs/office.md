@@ -1,0 +1,307 @@
+# The office — the unit this product is actually organized around
+
+Everything Handsel does past "post one job, get one deliverable" happens
+*inside an office*. This is the map of that word: what an office is made of,
+in the order it was built, and which doc or file owns each part. Read this
+first when a task touches anything office-shaped; each section links to the
+doc that goes deep.
+
+## Why it is the unit, and not just a folder for agents
+
+An office is not only an organising convenience. It is **the thing that
+borrows.**
+
+`docs/product-thesis.md` states the narrow claim this product actually makes —
+*"an escrow-collateralized advance to a prime contractor, where the credit
+score prices execution risk and therefore sets LTV"* — and why that is a fact
+rather than a forecast: the prime posts each subtask escrowed **from its own
+wallet**, while the parent bounty releases to it only on completion. *"So the
+prime pays N subcontractors before it is paid. That is a working capital gap,
+and it is a timing fact in shipped code."*
+
+That prime is an office role. `hireOfficeTemplateFor` takes a `primeAgentId`
+and stores it on the delegation the office runs (`lib/office-hire.ts`), and
+both selling surfaces below front their escrow from that same wallet — the
+storefront's serving prime is literally the deposit address a Mail Desk quote
+advertises.
+
+So the layers line up: **an agent earns a score; an office is the balance
+sheet that score prices.** Everything in this document is either capacity the
+office can sell or evidence about how reliably it delivers, and both are
+inputs to one question — how much this desk can be advanced against work it
+has not been paid for yet. Read `docs/product-thesis.md` for the claim and
+`docs/competitive-landscape.md` for why underwriting, not the marketplace, is
+the layer being defended.
+
+## What an office is
+
+An **office** (`lib/office.ts`) is a named slot on an account — up to
+`MAX_OFFICE_SLOTS` per account — that a set of the account's agents sit in.
+That's the whole primitive: a slot, a name, a roster. Everything else in this
+document is something that can be *true of* an office, not part of its
+definition, which is why an office with nothing turned on is still a real,
+useful office (a place to organize agents) and not a half-built feature.
+
+```
+lib/office.ts                  slots, roster, the shareable connection code
+lib/office-hire.ts              stand up a template's whole roster in one call
+lib/office-world-data.ts        the office as data — everyone's rooms, state
+lib/office-world-server.ts      the live snapshot, real-query, no scripting
+lib/office-treasury.ts          real balances, per office and account-wide
+```
+
+**Connecting two offices** is a mutual, consented relationship (a shareable
+code, redeemed by the other account) — a discovery link, not a permission
+grant, since the market underneath is already permissionless on-chain. It's
+what turns "my office" into "the offices I can see," which is what several of
+the sections below build on.
+
+## Standing up a roster
+
+`hire_office` (`list_office_templates` first) stands up a whole desk of
+specialist agents in one call, each wired to a real external MCP server it
+can actually call — `office-connectors.md` is the record of which servers
+were probed and which of them work as workers, because "wired" and "useful"
+are different claims. `wire_office_agent` rewires any role after the fact,
+`test_mcp_connector` checks a server before anything is staked on it, and
+`set_office_source` gives every role in an office one shared document to work
+from. Hiring only **drafts** the pipeline — `confirm_delegation` is still the
+one step that escrows money, same as any other delegation.
+
+A role's connector is not limited to MCP. The office ConnectorEditor offers
+the probed servers as one-click cards (`lib/verified-connectors.ts`) **and**
+can bind a role to the owner's local machine: the same `connectLocalWorker`
+one-line command the profile page generates, run with `--workdir` and
+`--harness claude` (`docs/coding-harness.md`), makes that role a real coding
+agent with file access on the owner's own checkout. One office can then mix
+substrates in one pipeline — a local-files role, cloud-data roles, and steps
+left open to the market — all through the same escrow, grading and
+settlement path (`lib/agent-tasks.ts` dispatches per `runtimeType`).
+
+```
+docs/office-connectors.md      which real MCP servers work as office workers
+docs/verify-cloud-options-desk.md   running one template end to end, what's proven
+```
+
+## Watching it work
+
+The **diorama** (`app/(dashboard)/office/game/`, `.../game3d/` for the
+Three.js opt-in) renders one office from the inside: nine functional rooms
+(Research Lab, Strategy Room, Engineering Floor, QA/Red Team, Verification
+Court, Memory Archive, Skill Gym, Treasury, Market) assigned by what an agent
+is actually doing right now, not a status bucket — `docs/office-departments.md`
+is the full "why," including the taxonomy it replaced. `CompanyHqBar` on
+`/office` and `office-treasury.ts`/`company-treasury.ts` put real gas and USDC
+numbers on the same page — no placeholder ever stands in for a balance.
+
+```
+lib/office-functional-departments.ts   the nine-room assignment, pure & tested
+docs/office-departments.md             the redesign write-up
+lib/office-conversations.ts            real agent_messages rendered as pings
+lib/office-artifact-flights.ts         real deliverables rendered as flights
+```
+
+The rooms are **dollhouse cutaways**: walls stand at room height, and the two
+sides between the viewer and a room drop to a curb so you can see in. Which
+two those are is derived from the camera's own forward vector every frame, so
+turning the deck (Q/E) raises the walls that rotate out of the way and drops
+the ones that rotate into it. `game3d/walls.ts` holds the arithmetic — where
+the runs are, where the doors break them, how tall a wall facing the camera
+should be — as pure functions with `tests/office-walls.test.ts` on them,
+because the alternative is checking it by screenshot.
+
+Two constraints in that file are not taste and should not be changed without
+re-deriving them:
+
+- **Wall height is bounded by the gaps BETWEEN rooms.** At this isometric
+  elevation a wall of height H hides about 0.74·H tiles of ground behind it,
+  and the tightest gap in `game/world.ts` is the two tiles between the
+  owner's office and the first department row.
+- **Anything added for density goes where the collision grid is ALREADY
+  solid** — on wall tiles, on desks, at ceiling height, or off the walkable
+  grid entirely. `buildGrid` blocks every entry in `PROPS`, so furnishing a
+  room by adding props there walls it in and strands the pathfinder. That is
+  the whole reason `RoomDecor.tsx` exists as a separate file from
+  `RoomProps.tsx`.
+
+## Running itself
+
+Three things an office can be told to manage without a human touching a
+switch every day, each with an explicit bound and an owner-facing on/off:
+
+- **Automaton** (`lib/office-automaton.ts`) — keeps the office's own gas/bond
+  topped up inside a daily budget. `docs/office-automaton.md`.
+- **Lineage** (`lib/agent-lineage.ts`, `-server.ts`, `lib/lineage-mandate.ts`)
+  — breeds a fitter successor and retires an unfit one, evidence-scored, off
+  by default and **refused outright on a real-money deployment** unless the
+  explicit env opt-in is set. `docs/agent-lineage.md`.
+- **Auto-mine** (`lib/auto-mine.ts`, `lib/mining-scheduler.ts`) — a worker
+  claims qualifying open jobs by itself, several in parallel.
+  `docs/parallel-mining.md`.
+
+**`/autonomy`** (`lib/autonomy-console.ts` pure / `-server.ts`) is the
+read-only rollup of all of it plus the gas pool and auto-reply below, one
+merged audit log — it owns none of the switches, only reports what each one
+already decided, so it can never disagree with the page that actually governs
+a given switch.
+
+## Pursuing a goal over time
+
+Everything above is capacity. An **office session** (`docs/office-sessions.md`)
+is what the office does with it: a goal, planned into a task graph, handed
+task by task to a coding harness on the owner's machine or to the market,
+watched, checkpointed, verified, paid within a written approval policy,
+escalated to a person for the rest, and resumed after a crash from the last
+checkpoint. The session is the unit past one job; a job stays what it is
+(one deliverable, one release), and an escrow task of a session IS a job,
+posted with `autoApprove` off and released only through the existing
+release site once the policy says yes. The internal lane — the owner's own
+Claude Code on the owner's own checkout — posts no escrow and writes no
+credit event.
+
+```
+lib/office-session.ts          statuses, transitions, the event log's reducer, invariants
+lib/office-session-loop.ts     one heartbeat: interpret → plan → verify → decide → settle → dispatch → learn
+lib/approval-policy.ts         ALLOW / ALLOW_WITH_LOG / REQUIRE_OWNER / REQUIRE_REVIEWER / DENY
+lib/coding-harness.ts          the CodingHarness contract; a workspace grant → Claude Code's flags
+lib/office-session-server.ts   tables, the worker protocol on the poll, commands, owner actions
+/office/sessions               the control room: inbox, sessions, fleet, budget, policy, memory
+```
+
+`/office/sessions` is where an owner connects Claude Code once, gives the
+office a goal, and steps in only where the policy says a person must — and
+the strip at the top of `/office` and the dashboard home is the same
+picture in one glance: what is running, what needs you, what was paid.
+
+## Selling itself
+
+An office doesn't have to wait for the owner to bring it customers.
+
+- **Storefront** (`lib/office-storefront.ts`, `lib/storefront-pricing.ts`) —
+  opens a commission endpoint over x402 (`/api/storefront/*`); any client,
+  human or agent, pays and the office does the work. Opened from the
+  Storefront panel on `/office` or the `set_storefront` MCP tool — for most
+  of this feature's life only the latter existed, which is the likeliest
+  reason it has served zero outside orders (`docs/failure-modes.md` §42).
+  `docs/office-storefront.md`.
+- **Mail Desk** (`lib/mail-desk.ts`, `POST /api/mail/inbound`) — the same
+  `commissionOffice()` fulfillment path, reached by email instead of x402:
+  quote → unique-cents USDC match → commission → deliver, inbound-only by
+  policy (never cold outreach). `docs/mail-desk.md`.
+
+Both reuse one fulfillment engine on purpose — a channel is how a customer
+reaches the office, not a second thing the office has to know how to do.
+
+## Talking — to its own agents, and to everyone else's
+
+The free lane (`lib/agent-messages.ts`) was open from the start — any
+registered agent may message any other, no escrow, no approval, because
+approval is for money and messages move none. For most of this project's life
+that lane was **decoration**: every consumer of it was a renderer (the
+diorama's pings, `/messages`, `check_inbox`), and nothing dispatched a message
+to its recipient's own runtime. Three pieces closed that, in the order they
+solve a different part of "make it real":
+
+- **The network** (`lib/agent-network.ts`, `/office/network`) — the outside
+  view the diorama can't draw: every agent and office as one graph, edges for
+  everything that actually moved between them (messages, delegation
+  handoffs, escrowed jobs, office links), visibility enforced as a rule
+  (`edgeVisibility`) rather than a filter someone remembered to apply.
+  `docs/agent-network.md`.
+- **Broadcast** (`lib/agent-broadcast.ts`) — one question to a whole room —
+  your office, or a connected one — instead of discovering and messaging
+  names one at a time. Capped, consent-backed, deliberately no market-wide
+  scope.
+- **Auto-reply** (`lib/agent-reply.ts`, `-server.ts`) — the recipient's own
+  runtime answers a question by itself, opt-in, bounded so a two-bot exchange
+  terminates by construction rather than by heuristic, and never touches
+  `agent_events` — a reply is not graded, paid, or scored.
+
+Auto-reply answers in whatever voice the recipient agent happens to have.
+**The counter** (`lib/office-counter.ts`, `-server.ts`) gives that voice an
+owner: plain-language instructions, set on `/office`, that shape both an
+auto-replying agent's tone and the Mail Desk's greeting to a stranger — live,
+not frozen at hire time, and never able to authorize money or a job. The
+first save provisions the agent and turns its auto-reply on; there is no
+separate hire step. `docs/office-counter.md`.
+
+All three are also MCP tools (`agent_network`, `broadcast_to_office`,
+`set_auto_reply`), so an assistant working this market has the same reach a
+human does from the dashboard.
+
+## Privacy — permission level vs visibility level
+
+A job has two separable levels, and for most of this project's life only one
+of them existed in practice:
+
+- **Permission level** (who may claim): every office pipeline step is posted
+  reserved to a specific roster agent (`assignedAgentId`), and both accept
+  paths (`acceptAndDispatchJob`, `acceptJobForExternalWorker` in
+  `lib/labor-dispatch.ts`) additionally refuse a claimant from outside the
+  owner's connected-office circle before any gas is spent.
+- **Visibility level** (who may see the brief): every office-hire step now
+  carries `officeOnly: true` (`lib/office-hire.ts`), which `lib/delegation.ts`
+  stores as `jobSpec.officeOwnerId`. One rule — `officeJobVisible`
+  (`lib/office.ts`, pure) / `canSeeOfficeOnlyJob` (DB) — is asked by every
+  read: the board listing, `browse_open_jobs`, `get_job`, `get_contract`,
+  the guest/live feed, and `/world`. Owner and connected offices see the
+  brief; everyone else sees at most existence, status and bounty.
+
+Two honest caveats. The on-chain contract stays **permissionless** —
+`acceptJob` has no allowlist, and adding one would change the product; but
+only the `specHash` lives on-chain, the brief exists only in this DB, so the
+API gate is the real protection: a stranger who accepts on-chain directly
+buys a job it can never read. And the **planner LLM** still may only set
+`officeOnly` on `reviewOf` steps (`parseSubtasks`) — server-side constructors
+scope whole pipelines, a model must not be able to hide market work from the
+board. Wiring pinned by `tests/job-visibility-scope.test.ts`.
+
+## What the office has not proven
+
+Read this next to the inventory above, because the inventory is a list of what
+is **built** and this is the list of what is **used**. Both belong in the same
+document; a map that shows only capacity reads as a demand claim it cannot
+support.
+
+- **Sales availability and demand are separate measurements.** On 2026-09-09,
+  a read of the production `/api/storefront` reported Research Desk open at
+  $9 with five slots remaining; Venture Lab and Growth Studio were closed.
+  The inspected owner's MCP account had no open storefront. Those are different
+  scopes, not contradictory observations. Neither response proves paid orders,
+  repeat customers or profitable delivery. Earlier all-closed observations were
+  historical snapshots, not the current platform state.
+- **The advance path is built, but external lending is not.** `lib/advance.ts`
+  and `lib/advance-server.ts` connect the orchestration LTV to an accepted
+  job's assigned payee and disbursement, through `/advance`. The action in
+  `app/actions/advance.ts` requires both borrower and lender to belong to the
+  signed-in user. This is not yet a cross-account capital market, and no live
+  borrowing or demand was verified by this read-only audit.
+- **Storefront payment is not yet seller-specific revenue settlement.**
+  x402 payment goes to `X402_PAY_TO`, while the selected desk's prime fronts
+  its pipeline from its own wallet. The current selector chooses the oldest
+  enabled desk for a template. Do not describe this as buyer-selected office
+  commerce with automatic external revenue distribution to each seller.
+
+None of this argues against the office. It argues against reading this document
+as evidence of pull. `docs/interop-outreach.md` holds the honest measure of
+that, including its own inbound finding: of eight "opportunities" a third-party
+bounty crawler surfaced across GitHub, **not one was somebody offering to pay.**
+
+## The office, end to end
+
+```
+hire (or build a roster by hand)
+  → confirm_delegation escrows the pipeline
+  → the diorama shows it running, the treasury shows what it's worth
+  → automaton/lineage/auto-mine keep it fed without a human in the loop
+  → a session pursues a goal over time: Claude Code on the owner's machine,
+    checkpoints, a written approval policy, resume after a crash
+  → storefront / mail desk bring in customers nobody had to introduce
+  → the network graph shows who it talks to; broadcast and auto-reply
+    make that talking cost nothing and require nobody watching
+  → /autonomy is where an owner checks all of the above at a glance
+```
+
+Nothing above is fake data standing in for a feature — every number in every
+piece is a live query (CLAUDE.md's rule), and a piece with nothing to show is
+supposed to look quiet rather than staged.

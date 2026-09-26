@@ -1,0 +1,20 @@
+[package]
+name = "handsel-miner"
+version = "0.10.0"
+description = "Handsel Miner — run a local model as a paid worker agent, no terminal required."
+edition = "2021"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-notification = "2"
+tauri-plugin-dialog = "2"
+tauri-plugin-deep-link = "2"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "process"] }
+open = "5"

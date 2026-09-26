@@ -1,0 +1,75 @@
+name: Desktop Miner — build installers
+
+# The dev sandbox this app was written in is Linux-only and can't produce
+# real Windows/macOS installers itself (no cross-toolchain, no code-signing
+# certs). This workflow is that missing cross-platform build step: it
+# compiles desktop/ on real windows-latest/macos-latest runners and attaches
+# the resulting installers to a GitHub Release.
+#
+# Two triggers, two publish behaviors:
+# - Push a `desktop-v*` tag → the release publishes DIRECTLY (pushing a
+#   version tag IS the human's explicit release decision; a draft step on
+#   top of it is redundant). Easiest way without a terminal: GitHub →
+#   Releases → "Draft a new release" → type a new desktop-vX.Y.Z tag →
+#   publish; the tag creation fires this workflow, which attaches the
+#   installers to that same release.
+# - Manual run (Actions tab → Run workflow) → DRAFT release, for test
+#   builds a human reviews before publishing.
+#
+# Keep tauri.conf.json + Cargo.toml versions in step with the tag.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to attach artifacts to (e.g. desktop-v0.1.0)'
+        required: false
+        default: 'desktop-dev'
+  push:
+    tags:
+      - 'desktop-v*'
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.platform }}
+    # tauri-action calls the Releases API (create/update release, upload
+    # asset) using GITHUB_TOKEN — many repos default that token to
+    # read-only, which fails as "Resource not accessible by integration".
+    # This grants exactly the write scope that call needs, for this
+    # workflow only (least-privilege — it doesn't touch repo settings).
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: echo "value=${{ github.event_name == 'push' && github.ref_name || inputs.tag }}" >> "$GITHUB_OUTPUT"
+
+      - name: Build and attach installers
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ steps.tag.outputs.value }}
+          releaseName: 'Handsel Miner ${{ steps.tag.outputs.value }}'
+          releaseBody: |
+            Download the installer for your OS below.
+
+            **Windows** users: SmartScreen will warn "Windows protected your PC" because this
+            build isn't code-signed yet — click "More info" → "Run anyway".
+            **Mac** users: Gatekeeper will say the app "is damaged" for the same reason — right-click
+            the app → Open, or run `xattr -cr "Handsel Miner.app"` in Terminal once.
+
+            See [desktop/README.md](https://github.com/${{ github.repository }}/blob/main/desktop/README.md)
+            for setup help.
+          releaseDraft: ${{ github.event_name != 'push' }}
+          prerelease: false

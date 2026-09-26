@@ -1,0 +1,29 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="Ledgermind">
+  <!-- Ledgermind mark: a ledger card, ruled lines, and a verification
+       check that doubles as the L's baseline — verified history as the
+       foundation of credit. -->
+  <defs>
+    <linearGradient id="lm-bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#232B3E"/>
+      <stop offset="1" stop-color="#151A28"/>
+    </linearGradient>
+    <linearGradient id="lm-check" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#34D399"/>
+      <stop offset="1" stop-color="#10B981"/>
+    </linearGradient>
+  </defs>
+
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#lm-bg)"/>
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="none" stroke="#3B4763" stroke-width="1.5"/>
+
+  <!-- ledger ruling -->
+  <line x1="16" y1="18" x2="48" y2="18" stroke="#4C5A7A" stroke-width="2.5" stroke-linecap="round" opacity="0.55"/>
+  <line x1="16" y1="27" x2="42" y2="27" stroke="#4C5A7A" stroke-width="2.5" stroke-linecap="round" opacity="0.4"/>
+  <line x1="16" y1="36" x2="45" y2="36" stroke="#4C5A7A" stroke-width="2.5" stroke-linecap="round" opacity="0.3"/>
+
+  <!-- L upright -->
+  <path d="M20 16 V46" stroke="#E8ECF5" stroke-width="6" stroke-linecap="round"/>
+
+  <!-- verification check, doubling as the L's baseline -->
+  <path d="M20 46 L30 54 L50 30" fill="none" stroke="url(#lm-check)" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
